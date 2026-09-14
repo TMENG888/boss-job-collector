@@ -256,6 +256,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         state.queueIndex = 0;
         state.searchUrl = state.queue[0] || '';
         state.enrichScheduled = false;
+        state.concurrency = Math.max(1, Math.min(6, parseInt(msg.concurrency, 10) || 1));
         setStatus('RUN', '正在打开/定位搜索页面…');
         await saveState();
         try {
@@ -339,6 +340,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       /* ---------- JD 详情补全 ---------- */
+      case 'GET_CONCURRENCY': {
+        sendResponse({ concurrency: state.concurrency || 1 });
+        break;
+      }
       case 'GET_NEXT_PENDING': {
         const now = Date.now();
         // 超过 60s 未返回的任务视为失败，可重试
@@ -405,6 +410,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         state.enrich = true;
         state.enrichScheduled = false; // 手动触发前重置，保证后续自动调度可用
+        state.concurrency = Math.max(1, Math.min(6, parseInt(msg.concurrency, 10) || 1));
         let tabId = activeTabId;
         if (!(await tabExists(tabId))) {
           const tab = await openSearchPage(

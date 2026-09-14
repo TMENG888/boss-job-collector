@@ -716,6 +716,15 @@
   /* ================= JD 批量补全 ================= */
   let enriching = false;
   let enrichAborted = false;
+  let jdConcurrency = 1;
+
+  async function getConcurrency() {
+    try {
+      const resp = await ask({ type: 'GET_CONCURRENCY' });
+      if (resp && resp.concurrency) jdConcurrency = Math.max(1, Math.min(6, resp.concurrency | 0));
+    } catch (e) { /* 后台休眠等异常时沿用当前值 */ }
+    return jdConcurrency;
+  }
 
   async function enrichOne(resp, slow) {
     if (enrichAborted) return;
@@ -738,35 +747,48 @@
       d.jd = FontDecoder.decodeText(d.jd);
     }
     fire({ type: 'JD_RESULT', key: resp.job.key, detail: d });
+    // 失败退避：请求异常/超时后额外多等一会，降低连击触发风控的概率
+    if (d.via === 'fail' || d.via === 'timeout') await sleep(2500 + Math.random() * 2000);
     await sleep(slow ? 700 + Math.random() * 900 : 300 + Math.random() * 300);
+  }
+
+  // 并发池：n 个 worker 各自领任务→抓取→上报；后台领任务时同步标记 detailFetching，天然防重复
+  async function runEnrichPool(budgetMs, t0) {
+    const n = await getConcurrency();
+    const worker = async (first) => {
+      for (;;) {
+        if (enrichAborted) return;
+        if (budgetMs && Date.now() - t0 > budgetMs - 600) return;
+        const resp = await ask({ type: 'GET_NEXT_PENDING' });
+        if (!resp) { if (first) report('WARN', '与后台连接中断，JD获取已暂停'); return; }
+        if (!resp.job) return;
+        if (first && !budgetMs && resp.pending % 10 === 0)
+          report('ENRICH', `获取JD详情（剩 ${resp.pending} 条）：${resp.job.name}`);
+        await enrichOne(resp, !budgetMs);
+      }
+    };
+    const ws = [];
+    for (let i = 0; i < n; i++) ws.push(worker(i === 0));
+    await Promise.all(ws);
   }
 
   // 翻页等待期间穿插JD补全，充分利用时间窗
   async function delayWithEnrich() {
     const budget = CONFIG.pageDelay[0] + Math.random() * (CONFIG.pageDelay[1] - CONFIG.pageDelay[0]);
     const t0 = Date.now();
-    for (;;) {
-      const left = budget - (Date.now() - t0);
-      if (left <= 500) { await sleep(Math.max(0, left)); return; }
-      const resp = await ask({ type: 'GET_NEXT_PENDING' });
-      if (!resp || !resp.job) { await sleep(Math.max(0, left)); return; }
-      await enrichOne(resp, false);
-    }
+    await runEnrichPool(budget, t0);
+    const left = budget - (Date.now() - t0);
+    if (left > 0) await sleep(left);
   }
 
-  async function enrichAll() {
+  async function enrichAll(concurrency) {
     if (enriching) return;
     enriching = true;
     enrichAborted = false;
+    if (concurrency) jdConcurrency = Math.max(1, Math.min(6, concurrency | 0));
     try {
-      for (;;) {
-        if (enrichAborted) break;
-        const resp = await ask({ type: 'GET_NEXT_PENDING' });
-        if (!resp) { report('WARN', '与后台连接中断，JD获取已暂停'); break; }
-        if (!resp.job) { report('DONE', 'JD详情全部获取完成 ✔ 可点击"导出CSV"'); break; }
-        report('ENRICH', `获取JD详情（剩 ${resp.pending} 条）：${resp.job.name}`);
-        await enrichOne(resp, true);
-      }
+      await runEnrichPool(0);
+      if (!enrichAborted) report('DONE', 'JD详情全部获取完成 ✔ 可点击"导出CSV"');
     } catch (e) {
       report('WARN', 'JD获取中断：' + (e && e.message));
     }
@@ -826,7 +848,7 @@
       enrichAborted = true; // 同步中断JD补全
       sendResponse({ ok: true });
     } else if (msg.type === 'START_ENRICH') {
-      enrichAll();
+      enrichAll(msg.concurrency);
       sendResponse({ ok: true });
     } else if (msg.type === 'PING') {
       sendResponse({ ok: true, cards: findCards().length });

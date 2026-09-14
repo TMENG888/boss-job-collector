@@ -13,11 +13,11 @@
   h1 { font-size: 15px; margin: 0 0 12px; }
   .row { margin-bottom: 10px; }
   label { display: block; color: #6b7280; margin-bottom: 3px; font-size: 12px; }
-  input[type="text"], input[type="number"] {
+  input[type="text"], input[type="number"], select {
     width: 100%; box-sizing: border-box; padding: 6px 8px;
     border: 1px solid #ddd; border-radius: 6px; font-size: 13px; outline: none;
   }
-  input:focus { border-color: #00bebc; }
+  input:focus, select:focus { border-color: #00bebc; }
   .grid { display: flex; gap: 8px; }
   .grid > div { flex: 1; }
   .hint { color: #9aa0aa; font-size: 11px; margin-top: 3px; }
@@ -63,13 +63,26 @@
     </div>
   </div>
 
+  <div class="row">
+    <label>JD详情并发数（越高越快，也越容易触发风控）</label>
+    <select id="concurrency">
+      <option value="1">1（稳妥 · 约1条/秒）</option>
+      <option value="2">2（推荐 · 约2条/秒）</option>
+      <option value="3">3（较快）</option>
+      <option value="4">4</option>
+      <option value="5">5</option>
+      <option value="6">6（激进 · 易触发滑块）</option>
+    </select>
+    <div class="hint">建议 1~3，新账号用 1；若频繁弹滑块验证请调回 1。翻页等待期间同样按此并发穿插抓取</div>
+  </div>
+
   <div class="row checkbox-row">
     <input type="checkbox" id="useCurrent">
     <label for="useCurrent">采集当前已打开的搜索页（忽略上方关键词）</label>
   </div>
   <div class="row checkbox-row">
     <input type="checkbox" id="enrichCheck" checked>
-    <label for="enrichCheck">采集后自动获取JD职位详情（较慢，约1条/秒）</label>
+    <label for="enrichCheck">采集后自动获取JD职位详情（速度取决于并发数设置）</label>
   </div>
 
   <button class="btn-start" id="startBtn">开始采集</button>

@@ -69,6 +69,10 @@ function buildUrl(keyword, city) {
 $('startBtn').addEventListener('click', async () => {
   const target = Math.max(1, Math.min(1000, parseInt($('target').value, 10) || 100));
   const enrich = $('enrichCheck').checked;
+  const concurrency = Math.max(1, Math.min(6, parseInt($('concurrency').value, 10) || 1));
+  // 并发数两种模式都即时保存
+  const d0 = await chrome.storage.local.get(SETTINGS_KEY);
+  await chrome.storage.local.set({ [SETTINGS_KEY]: Object.assign({}, d0[SETTINGS_KEY], { concurrency }) });
   let urls;
   if ($('useCurrent').checked) {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -92,12 +96,15 @@ $('startBtn').addEventListener('click', async () => {
     }
   }
   setStatus('RUN', `正在启动（共 ${urls.length} 个搜索词）…`);
-  chrome.runtime.sendMessage({ type: 'START', urls, url: urls[0], target, enrich });
+  chrome.runtime.sendMessage({ type: 'START', urls, url: urls[0], target, enrich, concurrency });
 });
 
 $('stopBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'STOP' }));
 $('exportBtn').addEventListener('click', exportCSV);
-$('jdBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'START_ENRICH_CMD' }));
+$('jdBtn').addEventListener('click', () => chrome.runtime.sendMessage({
+  type: 'START_ENRICH_CMD',
+  concurrency: Math.max(1, Math.min(6, parseInt($('concurrency').value, 10) || 1))
+}));
 $('sanitizeBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'SANITIZE' }));
 $('clearBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'CLEAR' }));
 
@@ -107,6 +114,7 @@ $('clearBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type:
   $('keyword').value = s.keyword || 'RPA';
   $('city').value = s.city || '101280100';
   $('target').value = s.target || 100;
+  $('concurrency').value = s.concurrency || 1;
   refresh();
   setInterval(refresh, 800);
 })();
