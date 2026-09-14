@@ -52,8 +52,6 @@
       '.company-tags li',
       '.company-box ul li'
     ],
-    hr: ['.info-public', '.boss-name', '[class*="boss-name"]'],
-    pubTime: ['.info-pub-time', '.job-pub-time', '.pub-time', '[class*="pub-time"]', '[class*="active-time"]'],
     next: ['a[ka="page-next"]', '[ka="page-next"]', '.page-next', '.ui-icon-arrow-page-next']
   };
 
@@ -76,10 +74,6 @@
     '.nc-container,.nc_wrapper,#nc_1_wrapper,.geetest_panel,.geetest_window,' +
     'iframe[src*="captcha"],iframe[src*="geetest"],iframe[src*="verify"],' +
     '[class*="sec-code"],[class*="verify-wrap"],[class*="captcha"]';
-
-  // 时间文本分类：活跃状态 vs 发布时间
-  const ACTIVE_TXT_RE = /(今日活跃|刚刚活跃|本月活跃|在线|刚刚)/;
-  const PUB_TXT_RE = /(发布|今天|昨天|刚刚|\d+分钟前|\d+小时前|\d+天前|\d{4}[-/]\d{1,2}[-/]\d{1,2})/;
 
   const SALARY_RE =
     /((?:\d+(?:\.\d+)?)\s*[-–~]\s*(?:\d+(?:\.\d+)?)\s*[Kk万W]?(?:\s*·\s*\d+薪)?|(?:\d+(?:\.\d+)?)\s*[Kk万](?:\s*·\s*\d+薪)?|\d+\s*元\s*\/\s*[天日月]|面议)/;
@@ -125,13 +119,6 @@
     return clone.textContent
       .replace(/[ \t\u00a0]+/g, ' ')
       .replace(/\n\s*\n+/g, '\n')
-      .trim();
-  }
-
-  // 清洗 HR 名：去掉“·今日活跃”之类的尾巴
-  function cleanHR(t) {
-    return String(t || '')
-      .replace(/[·\s]*(今日活跃|刚刚活跃|本月活跃|在线|刚刚).*$/, '')
       .trim();
   }
 
@@ -384,19 +371,9 @@
       const funding = cTags.find((t) => FUND_RE.test(t)) || (cardText.match(FUND_RE) || [''])[0];
       const industry = cTags.filter((t) => t !== scale && t !== funding).join('、');
 
-      let pubTime = '', hrActive = '';
-      const ptRaw = txt(qsOne(SEL.pubTime, card));
-      if (ptRaw) {
-        // BOSS 卡片上多是“今日活跃”类状态，发布时间几乎不展示：分开归类，避免值与列名不匹配
-        if (ACTIVE_TXT_RE.test(ptRaw)) hrActive = ptRaw;
-        else if (PUB_TXT_RE.test(ptRaw)) pubTime = ptRaw;
-      }
-
       return {
         name, salary, area, experience, education, skills,
         company, industry, scale, funding,
-        hr: cleanHR(txt(qsOne(SEL.hr, card))),
-        pubTime, hrActive,
         link
       };
     } catch (e) {
@@ -562,65 +539,6 @@
 
   /* ================= JD 详情获取 ================= */
   /* ================= 详情页字段提取 ================= */
-  // HR 姓名/职位：位于“立即沟通”按钮附近，按 token 形态识别，避免抓到公司名
-  function extractHRInfo(root) {
-    const BAD =
-      /公司|有限|集团|科技|网络|信息|直聘|BOSS|查看|更多|活跃|在线|立即|沟通|职位|实习|工程师|开发|设计|运营|天|周|月|薪|元|K|招聘|最新|急聘|热招|停招|全职|兼职|远程|简历|投递/;
-    const TITLE_RE = /(招聘者|人事|HR|猎头|[\u4e00-\u9fa5]{1,6}(?:经理|主管|总监|专员|顾问|合伙人|负责人))/;
-    const ACTIVE_RE = /(今日活跃|刚刚活跃|本月活跃|在线|刚刚)/;
-    // 严格姓名形态：X女士/X先生/老师、拉丁昵称、或 2-4 字中文（且需与职位 token 相邻才有效）
-    const isNameTk = (tk) =>
-      !BAD.test(tk) &&
-      (/^[\u4e00-\u9fa5]{1,3}(?:女士|先生|老师)$/.test(tk) ||
-        /^[A-Za-z][A-Za-z0-9._-]{1,15}$/.test(tk) ||
-        /^[\u4e00-\u9fa5]{2,4}$/.test(tk));
-    const tokensOf = (t) =>
-      String(t || '').split(/[·|｜\s]+/).map((s) => s.trim()).filter(Boolean);
-    const scanTokens = (tokens) => {
-      let active = '';
-      for (const tk of tokens) if (!active && ACTIVE_RE.test(tk) && tk.length <= 8) active = tk;
-      // 姓名必须与职位 token 相邻，避免把“招聘中/最新”等状态标签误当人名（上一版的真实故障）
-      for (let i = 0; i < tokens.length; i++) {
-        if (!(TITLE_RE.test(tokens[i]) && tokens[i].length <= 12)) continue;
-        for (const j of [i - 1, i + 1, i - 2, i + 2]) {
-          const tk = tokens[j];
-          if (tk && isNameTk(tk)) return { hr: tk, hrTitle: tokens[i], hrActive: active };
-        }
-      }
-      return { hr: '', hrTitle: '', hrActive: active };
-    };
-
-    const best = { hr: '', hrTitle: '', hrActive: '' };
-    const areas = [
-      root.querySelector('[class*="job-detail-op"]'),
-      root.querySelector('.job-banner'),
-      root.querySelector('[class*="boss-info"]')
-    ].filter(Boolean);
-    for (const area of areas) {
-      const r = scanTokens(tokensOf(area.innerText || area.textContent || ''));
-      if (!best.hrActive && r.hrActive) best.hrActive = r.hrActive;
-      if (r.hr) return r;
-    }
-    for (const el of root.querySelectorAll('[class*="boss"], [class*="publish"], [class*="poster"]')) {
-      const r = scanTokens(tokensOf(el.innerText || el.textContent || ''));
-      if (!best.hrActive && r.hrActive) best.hrActive = r.hrActive;
-      if (r.hr) return r;
-    }
-    // 终极兜底：全文档扫描“X女士/X先生/老师”叶子元素（严格称谓模式，无需职位相邻）
-    for (const el of root.querySelectorAll('span,div,a,p,em,b,i')) {
-      if (el.children.length) continue;
-      const t = (el.textContent || '').trim();
-      if (!t || t.length > 24 || BAD.test(t)) continue;
-      const mHr = t.match(/^[\u4e00-\u9fa5A-Za-z]{1,6}(?:女士|先生|老师)/);
-      if (!mHr) continue;
-      const mTi = t.match(TITLE_RE);
-      best.hr = cleanHR(mHr[0]);
-      best.hrTitle = mTi ? mTi[0] : '';
-      break;
-    }
-    return best;
-  }
-
   function extractDetail(doc) {
     const root = doc.documentElement || doc;
     const pick = (sels) => {
@@ -630,14 +548,38 @@
       }
       return null;
     };
-    let jdEl = pick(SEL_DETAIL.jd);
-    let jd = blockText(jdEl);
+    // JD 提取：职责/任职要求常被拆成多个分块，只取第一个会缺漏（CSV 实测约1/3缺“任职要求”）
+    // 策略：圈定 JD 模块容器避免混入侧栏公司简介 → 收集全部分块 → 只留最内层 → 按文档序去重拼接
+    const scope =
+      root.querySelector('[class*="job-desc"]') ||
+      root.querySelector('.job-detail-section') ||
+      root.querySelector('.detail-content');
+    let jd = '';
+    if (scope) {
+      const blocks = [];
+      for (const s of SEL_DETAIL.jd) {
+        qsa(s, scope).forEach((el) => {
+          const t = (el.textContent || '').trim();
+          if (t.length > 15) blocks.push(el);
+        });
+      }
+      const leaves = blocks.filter((el) => !blocks.some((o) => o !== el && el.contains(o)));
+      leaves.sort((a, b) =>
+        a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+      );
+      const parts = [];
+      for (const el of leaves) {
+        const t = blockText(el);
+        if (t && !parts.includes(t)) parts.push(t);
+      }
+      jd = parts.join('\n') || blockText(scope);
+    }
     if (!jd) {
       // 兜底：找包含 JD 关键词的文本块
-      const blocks = Array.from(root.querySelectorAll('div,section')).filter(
+      const kwBlocks = Array.from(root.querySelectorAll('div,section')).filter(
         (e) => e.textContent && e.textContent.length > 120
       );
-      const kw = blocks.find(
+      const kw = kwBlocks.find(
         (e) =>
           /岗位职责|工作职责|职位描述|任职要求|工作内容/.test(e.textContent) &&
           e.children.length < 8
@@ -648,7 +590,6 @@
     const areaEl = pick(SEL_DETAIL.area);
     const welfare = qsa(SEL_DETAIL.welfare, root).map(txt).filter(Boolean).join('、');
     const compEl = pick(SEL_DETAIL.companyBlock);
-    const hrInfo = extractHRInfo(root);
     // 公司信息块保留换行，供后台按 token 解析公司名/行业/规模/融资
     const raw = compEl ? String(compEl.innerText || compEl.textContent || '') : '';
     return {
@@ -656,9 +597,6 @@
       salary: salaryEl ? txt(salaryEl) : '',
       welfare,
       area: areaEl ? txt(areaEl) : '',
-      hr: hrInfo.hr,
-      hrTitle: hrInfo.hrTitle,
-      hrActive: hrInfo.hrActive || '',
       companyRaw: raw.replace(/[ \t\u00a0]+/g, ' ').trim()
     };
   }
@@ -713,14 +651,10 @@
     return iframeDetail(link);
   }
 
-  /* ================= JD 批量补全（双车道） ================= */
-  // 快车道：fetch + DOMParser，吃用户并发数（详情页 SSR，HTML 里就有 JD，很快）
-  // 慢车道：iframe 整页渲染修 HR，固定 2 路（HR 是客户端渲染，fetch 拿不到；
-  //   整页 JS 水合很重，6 路同时开 iframe 会争抢主线程/连接，吞吐反退化成单线——实测教训）
+  /* ================= JD 批量补全 ================= */
   let enriching = false;
   let enrichAborted = false;
   let jdConcurrency = 1;
-  let mainLanes = 0; // 正在跑的快车道 worker 数（慢车道借此判断何时收工）
 
   async function getConcurrency() {
     try {
@@ -745,53 +679,31 @@
     await sleep(slow ? 700 + Math.random() * 900 : 300 + Math.random() * 300);
   }
 
-  // HR 修复：iframe 整页加载后提取 HR/活跃度（只补 HR 类字段，不动已抓到的 JD）
-  async function repairOne(resp) {
-    try {
-      const r2 = await iframeDetail(resp.job.link);
-      if (!enrichAborted) fire({ type: 'HR_RESULT', key: resp.job.key, detail: r2 });
-    } catch (e) { /* 单条失败不影响其它，由后台 45s 超时回收重试 */ }
-    await sleep(400 + Math.random() * 600);
-  }
-
   // 并发池：n 个 worker 各自领任务→抓取→上报；后台领任务时同步标记，天然防重复
-  async function runEnrichPool(budgetMs, t0, mode) {
-    const n = mode === 'hr' ? 2 : await getConcurrency();
+  async function runEnrichPool(budgetMs, t0) {
+    const n = await getConcurrency();
     const worker = async (first) => {
       for (;;) {
         if (enrichAborted) return;
         if (budgetMs && Date.now() - t0 > budgetMs - 600) return;
-        const resp = await ask({ type: 'GET_NEXT_PENDING', mode: mode || 'jd' });
-        if (!resp) { if (first && mode !== 'hr') report('WARN', '与后台连接中断，JD获取已暂停'); return; }
-        if (!resp.job) {
-          // 快车道还在跑时，慢车道等待新完成的任务，而不是提前收工
-          if (mode === 'hr' && mainLanes > 0) { await sleep(800 + Math.random() * 400); continue; }
-          return;
-        }
-        if (mode === 'hr') {
-          await repairOne(resp);
-        } else {
-          if (first && !budgetMs && resp.pending % 10 === 0)
-            report('ENRICH', `获取JD详情（剩 ${resp.pending} 条）：${resp.job.name}`);
-          await enrichOne(resp, !budgetMs);
-        }
+        const resp = await ask({ type: 'GET_NEXT_PENDING' });
+        if (!resp) { if (first) report('WARN', '与后台连接中断，JD获取已暂停'); return; }
+        if (!resp.job) return;
+        if (first && !budgetMs && resp.pending % 10 === 0)
+          report('ENRICH', `获取JD详情（剩 ${resp.pending} 条）：${resp.job.name}`);
+        await enrichOne(resp, !budgetMs);
       }
     };
     const ws = [];
-    if (mode !== 'hr') mainLanes += n;
     for (let i = 0; i < n; i++) ws.push(worker(i === 0));
-    try {
-      await Promise.all(ws);
-    } finally {
-      if (mode !== 'hr') mainLanes -= n;
-    }
+    await Promise.all(ws);
   }
 
   // 翻页等待期间穿插JD补全，充分利用时间窗
   async function delayWithEnrich() {
     const budget = CONFIG.pageDelay[0] + Math.random() * (CONFIG.pageDelay[1] - CONFIG.pageDelay[0]);
     const t0 = Date.now();
-    await Promise.all([runEnrichPool(budget, t0, 'jd'), runEnrichPool(budget, t0, 'hr')]);
+    await runEnrichPool(budget, t0);
     const left = budget - (Date.now() - t0);
     if (left > 0) await sleep(left);
   }
@@ -802,8 +714,7 @@
     enrichAborted = false;
     if (concurrency) jdConcurrency = Math.max(1, Math.min(6, concurrency | 0));
     try {
-      // 快车道抓 JD + 慢车道修 HR 流水线并行；快车道全部收工后慢车道自然追平退出
-      await Promise.all([runEnrichPool(0, 0, 'jd'), runEnrichPool(0, 0, 'hr')]);
+      await runEnrichPool(0);
       if (!enrichAborted) report('DONE', 'JD详情全部获取完成 ✔ 可点击"导出CSV"');
     } catch (e) {
       report('WARN', 'JD获取中断：' + (e && e.message));

@@ -95,42 +95,12 @@ const FUND_RE =
   /(不需要融资|未融资|天使轮|A轮|B轮|C轮|D轮|已上市|国企|央企|民营|合资|外资|事业单位|独角兽)/;
 
 /* ---------- HR/时间字段校验（值与列名不匹配的防线） ---------- */
-const HR_BAD_RE = /公司|有限|集团|科技|网络|信息|直聘|BOSS|查看|更多|活跃|在线|沟通|职位|招聘|最新|急聘|热招|停招|全职|兼职|远程|实习|工程师|开发|设计|运营|默认|匿名|此岗位/;
-const HR_NAME_RE = /^[\u4e00-\u9fa5]{1,3}(?:女士|先生|老师)$|^[A-Za-z][A-Za-z0-9._-]{1,15}$|^[\u4e00-\u9fa5]{2,4}$/;
-const HR_TITLE_RE = /(招聘者|人事|HR|猎头|经理|主管|总监|专员|顾问|合伙人|负责人)/;
-const ACTIVE_VAL_RE = /(今日活跃|刚刚活跃|本月活跃|在线|刚刚)/;
-const PUB_VAL_RE = /(发布|今天|昨天|刚刚|\d+分钟前|\d+小时前|\d+天前|\d{4}[-/年]\d{1,2}[-/月]\d{1,2})/;
-
-function validHRName(t) {
-  t = String(t || '').trim();
-  if (!t || t.length > 16 || HR_BAD_RE.test(t)) return '';
-  return HR_NAME_RE.test(t) ? t : '';
-}
-function validHRTitle(t) {
-  t = String(t || '').trim();
-  if (!t || t.length > 16) return '';
-  return HR_TITLE_RE.test(t) ? t : '';
-}
-// 时间文本归类：活跃状态 / 发布时间 / 垃圾值（丢弃），避免“最新/招聘中”这类值混进时间列
-function classifyTime(t) {
-  t = String(t || '').trim();
-  if (!t) return { active: '', pub: '' };
-  if (ACTIVE_VAL_RE.test(t)) return { active: t, pub: '' };
-  if (PUB_VAL_RE.test(t)) return { active: '', pub: t };
-  return { active: '', pub: '' };
-}
 // 对单条记录做校验修复，返回是否有变更
 function sanitizeJob(j) {
-  const company = String(j.company || '').trim();
   let changed = false;
-  const hr0 = j.hr, t0 = j.hrTitle, p0 = j.pubTime, a0 = j.hrActive;
-  j.hr = validHRName(j.hr);
-  if (j.hr && company && (j.hr.includes(company) || company.includes(j.hr))) j.hr = '';
-  j.hrTitle = validHRTitle(j.hrTitle);
-  const c = classifyTime(j.pubTime);
-  if (c.active && !j.hrActive) j.hrActive = c.active;
-  j.pubTime = c.pub;
-  if (hr0 !== j.hr || t0 !== j.hrTitle || p0 !== j.pubTime || a0 !== j.hrActive) changed = true;
+  const c0 = j.company;
+  j.company = String(j.company || '').trim();
+  if (c0 !== j.company) changed = true;
   return changed;
 }
 
@@ -161,12 +131,6 @@ function parseCompanyRaw(raw, companyName) {
     }
   }
   return out;
-}
-
-function cleanHRBg(t) {
-  return String(t || '')
-    .replace(/[·\s]*(今日活跃|刚刚活跃|本月活跃|在线|刚刚).*$/, '')
-    .trim();
 }
 
 // 薪资合并：详情页薪资优先（更新、已解密）；但若详情页解密不全（含□）而列表薪资完好，则保留列表薪资
@@ -346,40 +310,14 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case 'GET_NEXT_PENDING': {
         const now = Date.now();
-        // 超过 60s/45s 未返回的任务视为失败，可重试
+        // 超过 60s 未返回的任务视为失败，可重试
         const retryable = (j) => j.detailFetching && now - (j.fetchStartedAt || 0) > 60000;
-        const hrRetryable = (j) => j.hrFetching && now - (j.hrStartedAt || 0) > 45000;
-        const mode = msg.mode === 'hr' ? 'hr' : 'jd';
-        let pending, j;
-        if (mode === 'hr') {
-          // 慢车道：已抓到 JD 但缺 HR 的岗位（iframe 修复，每个岗位最多试 2 次）
-          pending = state.collected.filter(
-            (x) => state.enrich && x.detailFetched && !x.hr &&
-                   (!x.hrFetching || hrRetryable(x)) && (x.hrTries || 0) < 2
-          );
-          if (!pending.length) {
-            sendResponse({ job: null, pending: 0, total: state.collected.length });
-            break;
-          }
-          j = pending[0];
-          j.hrFetching = true;
-          j.hrStartedAt = now;
-          j.hrTries = (j.hrTries || 0) + 1;
-          await saveState();
-          sendResponse({
-            job: { key: jobKey(j), link: j.link, name: j.name },
-            pending: pending.length,
-            total: state.collected.length
-          });
-          break;
-        }
-        // 快车道：还没抓到 JD 的岗位
-        pending = state.collected.filter((x) => !x.detailFetched || retryable(x));
+        const pending = state.collected.filter((x) => !x.detailFetched || retryable(x));
         if (!pending.length || !state.enrich) {
           sendResponse({ job: null, pending: 0, total: state.collected.length });
           break;
         }
-        j = pending[0];
+        const j = pending[0];
         j.detailFetching = true;
         j.fetchStartedAt = now;
         await saveState();
@@ -404,59 +342,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           j.scale = j.scale || comp.scale || '';
           j.funding = j.funding || comp.funding || '';
           j.area = j.area || d.area || '';
-          // HR 字段：先校验再入库，“招聘中/最新”等状态标签和公司名串位都会被拒
-          if (!j.hr) {
-            const hrCand = validHRName(d.hr);
-            if (hrCand && !(j.company && (hrCand.includes(j.company) || j.company.includes(hrCand)))) j.hr = hrCand;
-          }
-          if (!j.hrTitle) j.hrTitle = validHRTitle(d.hrTitle);
-          if (!j.hrActive && d.hrActive) j.hrActive = d.hrActive;
           sanitizeJob(j); // 终校验修复
           j.detailVia = d.via || '';
           // 抓到实质内容才算完成；失败时释放领取标记，限次重试（最多 3 次）
           j.detailTries = (j.detailTries || 0) + 1;
-          if (d.jd || d.hr || d.via === 'iframe' || j.detailTries >= 3) {
+          if (d.jd || d.via === 'iframe' || j.detailTries >= 3) {
             j.detailFetched = true;
           } else {
             j.detailFetching = false;
           }
           const left = pendingCount();
-          const hrLeft = state.collected.filter((x) => x.detailFetched && !x.hr).length;
           if (left > 0) {
             setStatus('ENRICH', `JD获取中：还剩 ${left} 条（已完成 ${state.collected.length - left}/${state.collected.length}）`);
-          } else if (hrLeft > 0) {
-            setStatus('ENRICH', `JD抓取完成，HR修复中：还剩 ${hrLeft} 条…`);
           } else {
             state.enrichScheduled = false;
             setStatus('DONE', `全部完成 ✔ 共 ${state.collected.length} 条（含JD详情），可点击"导出CSV"`);
-          }
-          await saveState();
-        }
-        sendResponse({ ok: true });
-        break;
-      }
-
-      case 'HR_RESULT': {
-        // 慢车道回报：只补空的 HR 类字段，绝不动已抓到的 JD/薪资/福利
-        const j2 = state.collected.find((x) => jobKey(x) === msg.key);
-        if (j2) {
-          const d2 = msg.detail || {};
-          if (!j2.hr) {
-            const hrCand = validHRName(d2.hr);
-            if (hrCand && !(j2.company && (hrCand.includes(j2.company) || j2.company.includes(hrCand)))) j2.hr = hrCand;
-          }
-          if (!j2.hrTitle) j2.hrTitle = validHRTitle(d2.hrTitle);
-          if (!j2.hrActive && d2.hrActive) j2.hrActive = d2.hrActive;
-          if (!j2.area && d2.area) j2.area = d2.area;
-          if (!j2.welfare && d2.welfare) j2.welfare = d2.welfare;
-          sanitizeJob(j2);
-          j2.hrFetching = false;
-          const hrLeft2 = state.collected.filter((x) => x.detailFetched && !x.hr).length;
-          if (hrLeft2 === 0 && pendingCount() === 0) {
-            state.enrichScheduled = false;
-            setStatus('DONE', `全部完成 ✔ 共 ${state.collected.length} 条（含JD详情），可点击"导出CSV"`);
-          } else if (pendingCount() === 0) {
-            setStatus('ENRICH', `JD抓取完成，HR修复中：还剩 ${hrLeft2} 条…`);
           }
           await saveState();
         }

@@ -4,7 +4,7 @@ const SETTINGS_KEY = 'boss_settings';
 
 const HEADERS = [
   '序号', '岗位名称', '薪资', '城市/区域', '经验要求', '学历要求', '技能标签', '福利标签',
-  '公司名称', '所属行业', '公司规模', '融资阶段', 'HR/发布者', 'HR职位', 'HR活跃度',
+  '公司名称', '所属行业', '公司规模', '融资阶段',
   'JD职位描述', '职位链接', '采集时间'
 ];
 
@@ -35,7 +35,7 @@ async function exportCSV() {
   jobs.forEach((j, i) => {
     rows.push([
       i + 1, j.name, j.salary, j.area, j.experience, j.education, j.skills, j.welfare,
-      j.company, j.industry, j.scale, j.funding, j.hr, j.hrTitle, j.hrActive || j.pubTime,
+      j.company, j.industry, j.scale, j.funding,
       j.jd, j.link,
       j.collectedAt ? new Date(j.collectedAt).toLocaleString('zh-CN') : ''
     ].map((v) => csvCell(v)).join(','));
