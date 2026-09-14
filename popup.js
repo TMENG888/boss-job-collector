@@ -62,6 +62,10 @@ async function refresh() {
   } catch (e) { /* ignore */ }
 }
 
+function buildUrl(keyword, city) {
+  return `https://www.zhipin.com/web/geek/jobs?city=${encodeURIComponent(city)}&query=${encodeURIComponent(keyword)}&page=1`;
+}
+
 $('startBtn').addEventListener('click', async () => {
   const target = Math.max(1, Math.min(1000, parseInt($('target').value, 10) || 100));
   const enrich = $('enrichCheck').checked;
