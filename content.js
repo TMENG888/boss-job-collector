@@ -713,10 +713,14 @@
     return iframeDetail(link);
   }
 
-  /* ================= JD 批量补全 ================= */
+  /* ================= JD 批量补全（双车道） ================= */
+  // 快车道：fetch + DOMParser，吃用户并发数（详情页 SSR，HTML 里就有 JD，很快）
+  // 慢车道：iframe 整页渲染修 HR，固定 2 路（HR 是客户端渲染，fetch 拿不到；
+  //   整页 JS 水合很重，6 路同时开 iframe 会争抢主线程/连接，吞吐反退化成单线——实测教训）
   let enriching = false;
   let enrichAborted = false;
   let jdConcurrency = 1;
+  let mainLanes = 0; // 正在跑的快车道 worker 数（慢车道借此判断何时收工）
 
   async function getConcurrency() {
     try {
@@ -730,17 +734,6 @@
     if (enrichAborted) return;
     const d = await fetchJobDetail(resp.job.link);
     if (enrichAborted) return;
-    // HR 姓名/职位是客户端渲染，fetch 到的 HTML 里没有：用渲染后的 iframe 二次补取
-    if (!d.hr && d.via === 'fetch') {
-      const r2 = await iframeDetail(resp.job.link);
-      if (!enrichAborted) {
-        d.hr = d.hr || r2.hr || '';
-        d.hrTitle = d.hrTitle || r2.hrTitle || '';
-        d.hrActive = d.hrActive || r2.hrActive || '';
-        d.area = d.area || r2.area || '';
-        if (!d.welfare && r2.welfare) d.welfare = r2.welfare;
-      }
-    }
     if (FontDecoder.isPUA(d.salary) || FontDecoder.isPUA(d.jd)) {
       await FontDecoder.init(null);
       d.salary = FontDecoder.decodeText(d.salary);
@@ -752,31 +745,53 @@
     await sleep(slow ? 700 + Math.random() * 900 : 300 + Math.random() * 300);
   }
 
-  // 并发池：n 个 worker 各自领任务→抓取→上报；后台领任务时同步标记 detailFetching，天然防重复
-  async function runEnrichPool(budgetMs, t0) {
-    const n = await getConcurrency();
+  // HR 修复：iframe 整页加载后提取 HR/活跃度（只补 HR 类字段，不动已抓到的 JD）
+  async function repairOne(resp) {
+    try {
+      const r2 = await iframeDetail(resp.job.link);
+      if (!enrichAborted) fire({ type: 'HR_RESULT', key: resp.job.key, detail: r2 });
+    } catch (e) { /* 单条失败不影响其它，由后台 45s 超时回收重试 */ }
+    await sleep(400 + Math.random() * 600);
+  }
+
+  // 并发池：n 个 worker 各自领任务→抓取→上报；后台领任务时同步标记，天然防重复
+  async function runEnrichPool(budgetMs, t0, mode) {
+    const n = mode === 'hr' ? 2 : await getConcurrency();
     const worker = async (first) => {
       for (;;) {
         if (enrichAborted) return;
         if (budgetMs && Date.now() - t0 > budgetMs - 600) return;
-        const resp = await ask({ type: 'GET_NEXT_PENDING' });
-        if (!resp) { if (first) report('WARN', '与后台连接中断，JD获取已暂停'); return; }
-        if (!resp.job) return;
-        if (first && !budgetMs && resp.pending % 10 === 0)
-          report('ENRICH', `获取JD详情（剩 ${resp.pending} 条）：${resp.job.name}`);
-        await enrichOne(resp, !budgetMs);
+        const resp = await ask({ type: 'GET_NEXT_PENDING', mode: mode || 'jd' });
+        if (!resp) { if (first && mode !== 'hr') report('WARN', '与后台连接中断，JD获取已暂停'); return; }
+        if (!resp.job) {
+          // 快车道还在跑时，慢车道等待新完成的任务，而不是提前收工
+          if (mode === 'hr' && mainLanes > 0) { await sleep(800 + Math.random() * 400); continue; }
+          return;
+        }
+        if (mode === 'hr') {
+          await repairOne(resp);
+        } else {
+          if (first && !budgetMs && resp.pending % 10 === 0)
+            report('ENRICH', `获取JD详情（剩 ${resp.pending} 条）：${resp.job.name}`);
+          await enrichOne(resp, !budgetMs);
+        }
       }
     };
     const ws = [];
+    if (mode !== 'hr') mainLanes += n;
     for (let i = 0; i < n; i++) ws.push(worker(i === 0));
-    await Promise.all(ws);
+    try {
+      await Promise.all(ws);
+    } finally {
+      if (mode !== 'hr') mainLanes -= n;
+    }
   }
 
   // 翻页等待期间穿插JD补全，充分利用时间窗
   async function delayWithEnrich() {
     const budget = CONFIG.pageDelay[0] + Math.random() * (CONFIG.pageDelay[1] - CONFIG.pageDelay[0]);
     const t0 = Date.now();
-    await runEnrichPool(budget, t0);
+    await Promise.all([runEnrichPool(budget, t0, 'jd'), runEnrichPool(budget, t0, 'hr')]);
     const left = budget - (Date.now() - t0);
     if (left > 0) await sleep(left);
   }
@@ -787,7 +802,8 @@
     enrichAborted = false;
     if (concurrency) jdConcurrency = Math.max(1, Math.min(6, concurrency | 0));
     try {
-      await runEnrichPool(0);
+      // 快车道抓 JD + 慢车道修 HR 流水线并行；快车道全部收工后慢车道自然追平退出
+      await Promise.all([runEnrichPool(0, 0, 'jd'), runEnrichPool(0, 0, 'hr')]);
       if (!enrichAborted) report('DONE', 'JD详情全部获取完成 ✔ 可点击"导出CSV"');
     } catch (e) {
       report('WARN', 'JD获取中断：' + (e && e.message));

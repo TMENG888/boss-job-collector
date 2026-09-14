@@ -346,14 +346,40 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
       case 'GET_NEXT_PENDING': {
         const now = Date.now();
-        // 超过 60s 未返回的任务视为失败，可重试
+        // 超过 60s/45s 未返回的任务视为失败，可重试
         const retryable = (j) => j.detailFetching && now - (j.fetchStartedAt || 0) > 60000;
-        const pending = state.collected.filter((j) => !j.detailFetched || retryable(j));
+        const hrRetryable = (j) => j.hrFetching && now - (j.hrStartedAt || 0) > 45000;
+        const mode = msg.mode === 'hr' ? 'hr' : 'jd';
+        let pending, j;
+        if (mode === 'hr') {
+          // 慢车道：已抓到 JD 但缺 HR 的岗位（iframe 修复，每个岗位最多试 2 次）
+          pending = state.collected.filter(
+            (x) => state.enrich && x.detailFetched && !x.hr &&
+                   (!x.hrFetching || hrRetryable(x)) && (x.hrTries || 0) < 2
+          );
+          if (!pending.length) {
+            sendResponse({ job: null, pending: 0, total: state.collected.length });
+            break;
+          }
+          j = pending[0];
+          j.hrFetching = true;
+          j.hrStartedAt = now;
+          j.hrTries = (j.hrTries || 0) + 1;
+          await saveState();
+          sendResponse({
+            job: { key: jobKey(j), link: j.link, name: j.name },
+            pending: pending.length,
+            total: state.collected.length
+          });
+          break;
+        }
+        // 快车道：还没抓到 JD 的岗位
+        pending = state.collected.filter((x) => !x.detailFetched || retryable(x));
         if (!pending.length || !state.enrich) {
           sendResponse({ job: null, pending: 0, total: state.collected.length });
           break;
         }
-        const j = pending[0];
+        j = pending[0];
         j.detailFetching = true;
         j.fetchStartedAt = now;
         await saveState();
@@ -387,14 +413,50 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           if (!j.hrActive && d.hrActive) j.hrActive = d.hrActive;
           sanitizeJob(j); // 终校验修复
           j.detailVia = d.via || '';
-          j.detailFetched = true;
-          j.detailFetching = false;
+          // 抓到实质内容才算完成；失败时释放领取标记，限次重试（最多 3 次）
+          j.detailTries = (j.detailTries || 0) + 1;
+          if (d.jd || d.hr || d.via === 'iframe' || j.detailTries >= 3) {
+            j.detailFetched = true;
+          } else {
+            j.detailFetching = false;
+          }
           const left = pendingCount();
+          const hrLeft = state.collected.filter((x) => x.detailFetched && !x.hr).length;
           if (left > 0) {
             setStatus('ENRICH', `JD获取中：还剩 ${left} 条（已完成 ${state.collected.length - left}/${state.collected.length}）`);
+          } else if (hrLeft > 0) {
+            setStatus('ENRICH', `JD抓取完成，HR修复中：还剩 ${hrLeft} 条…`);
           } else {
             state.enrichScheduled = false;
             setStatus('DONE', `全部完成 ✔ 共 ${state.collected.length} 条（含JD详情），可点击"导出CSV"`);
+          }
+          await saveState();
+        }
+        sendResponse({ ok: true });
+        break;
+      }
+
+      case 'HR_RESULT': {
+        // 慢车道回报：只补空的 HR 类字段，绝不动已抓到的 JD/薪资/福利
+        const j2 = state.collected.find((x) => jobKey(x) === msg.key);
+        if (j2) {
+          const d2 = msg.detail || {};
+          if (!j2.hr) {
+            const hrCand = validHRName(d2.hr);
+            if (hrCand && !(j2.company && (hrCand.includes(j2.company) || j2.company.includes(hrCand)))) j2.hr = hrCand;
+          }
+          if (!j2.hrTitle) j2.hrTitle = validHRTitle(d2.hrTitle);
+          if (!j2.hrActive && d2.hrActive) j2.hrActive = d2.hrActive;
+          if (!j2.area && d2.area) j2.area = d2.area;
+          if (!j2.welfare && d2.welfare) j2.welfare = d2.welfare;
+          sanitizeJob(j2);
+          j2.hrFetching = false;
+          const hrLeft2 = state.collected.filter((x) => x.detailFetched && !x.hr).length;
+          if (hrLeft2 === 0 && pendingCount() === 0) {
+            state.enrichScheduled = false;
+            setStatus('DONE', `全部完成 ✔ 共 ${state.collected.length} 条（含JD详情），可点击"导出CSV"`);
+          } else if (pendingCount() === 0) {
+            setStatus('ENRICH', `JD抓取完成，HR修复中：还剩 ${hrLeft2} 条…`);
           }
           await saveState();
         }
