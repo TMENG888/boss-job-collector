@@ -62,6 +62,30 @@ async function refresh() {
   } catch (e) { /* ignore */ }
 }
 
+// 城市名 → BOSS 城市代码（用户直接填城市名，无需查代码）
+const CITY_MAP = {
+  北京: '101010100', 上海: '101020100', 天津: '101030100', 重庆: '101040100',
+  广州: '101280100', 深圳: '101280600', 东莞: '101281600', 佛山: '101281000',
+  杭州: '101210100', 宁波: '101210400', 温州: '101210700',
+  南京: '101190100', 苏州: '101190400', 无锡: '101190200', 常州: '101191100',
+  武汉: '101200100', 西安: '101110100', 成都: '101270100',
+  长沙: '101250100', 郑州: '101180100', 青岛: '101120200', 济南: '101120100',
+  合肥: '101220100', 福州: '101230100', 厦门: '101230200',
+  沈阳: '101070100', 大连: '101070200', 长春: '101060100', 哈尔滨: '101050100',
+  石家庄: '101090100', 太原: '101100100', 南昌: '101240100', 贵阳: '101260100',
+  昆明: '101290100', 南宁: '101300100'
+};
+const CITY_NAME_BY_CODE = Object.fromEntries(Object.entries(CITY_MAP).map(([k, v]) => [v, k]));
+const CITY_ALL = '100010000'; // 全国
+
+// 解析用户输入：城市名/带“市”后缀/直接填代码/留空=全国
+function resolveCity(raw) {
+  const t = String(raw || '').trim().replace(/市$/, '');
+  if (!t) return CITY_ALL;
+  if (/^\d{9}$/.test(t)) return t; // 直接填了代码，原样使用
+  return CITY_MAP[t] || CITY_ALL;   // 未知城市名退回全国
+}
+
 function buildUrl(keyword, city) {
   return `https://www.zhipin.com/web/geek/jobs?city=${encodeURIComponent(city)}&query=${encodeURIComponent(keyword)}&page=1`;
 }
@@ -83,11 +107,13 @@ $('startBtn').addEventListener('click', async () => {
     urls = [tab.url];
   } else {
     const raw = $('keyword').value.trim() || 'RPA';
-    const city = $('city').value.trim() || '101280100';
-    // 多关键词用逗号分隔时逐个接力；每个关键词严格忠于自身检索结果，不做变体扩展
+    const cityInput = $('city').value.trim();
+    const city = resolveCity(cityInput);
+    // 多关键词用逗号分隔（中英文逗号、顿号均可）时逐个接力；
+    // 每个关键词严格忠于自身检索结果，不做变体扩展
     const keywords = raw.split(/[,，、]+/).map((x) => x.trim()).filter(Boolean);
     if (!keywords.length) keywords.push('RPA');
-    await chrome.storage.local.set({ [SETTINGS_KEY]: { keyword: raw, city, target } });
+    await chrome.storage.local.set({ [SETTINGS_KEY]: { keyword: raw, city, cityName: cityInput, target } });
     const seen = new Set();
     urls = [];
     for (const kw of keywords) {
@@ -111,7 +137,8 @@ $('clearBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type:
   const d = await chrome.storage.local.get(SETTINGS_KEY);
   const s = d[SETTINGS_KEY] || {};
   $('keyword').value = s.keyword || 'RPA';
-  $('city').value = s.city || '101280100';
+  // 兼容旧数据：存的是代码则反查城市名显示
+  $('city').value = s.cityName || CITY_NAME_BY_CODE[s.city] || (s.city === CITY_ALL ? '' : s.city) || '广州';
   $('target').value = s.target || 100;
   // 并发选择器已移除（串行采集）
   refresh();

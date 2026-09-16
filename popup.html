@@ -45,36 +45,28 @@
   <h1>📋 BOSS岗位采集助手</h1>
 
   <div class="row">
-    <label>岗位关键词（支持多个，用逗号分隔）</label>
+    <label>岗位关键词（多个用逗号分隔，采完一个自动接力下一个）</label>
     <input type="text" id="keyword" placeholder="如：爬虫实习生, python实习">
-    <div class="hint">BOSS 单个搜索词最多约 300 条；多个关键词用逗号分隔可自动接力，每个关键词只采集其自身检索结果</div>
   </div>
 
   <div class="row grid">
     <div>
-      <label>城市代码</label>
-      <input type="text" id="city" placeholder="101280100">
-      <div class="hint">广州101280100 深圳101280600 北京101010100<br>上海101020100 杭州101210100 成都101270100</div>
+      <label>城市（留空=全国）</label>
+      <input type="text" id="city" placeholder="如：广州">
     </div>
     <div>
       <label>目标数量</label>
       <input type="number" id="target" min="1" max="1000" value="100">
-      <div class="hint">达到该数量后自动停止</div>
     </div>
-  </div>
-
-  <div class="row">
-    <label>JD详情采集方式</label>
-    <div class="hint">模拟真人点击：复用当前已登录的标签页逐条进出详情页（一次一条，最稳）；采集期间请保持窗口可见，若弹出滑块请手动完成，完成后自动继续</div>
   </div>
 
   <div class="row checkbox-row">
     <input type="checkbox" id="useCurrent">
-    <label for="useCurrent">采集当前已打开的搜索页（忽略上方关键词）</label>
+    <label for="useCurrent">采集当前已打开的搜索页（忽略上方设置）</label>
   </div>
   <div class="row checkbox-row">
     <input type="checkbox" id="enrichCheck" checked>
-    <label for="enrichCheck">采集后自动获取JD职位详情（速度取决于并发数设置）</label>
+    <label for="enrichCheck">采集后自动获取JD职位详情</label>
   </div>
 
   <button class="btn-start" id="startBtn">开始采集</button>
@@ -90,10 +82,6 @@
     <div><span class="num" id="count">0</span> / <span id="targetShow">100</span> 条</div>
     <div class="bar"><i id="barFill"></i></div>
     <div class="status" id="status">空闲</div>
-  </div>
-
-  <div class="tips">
-    ⚠️ 请先在浏览器登录 BOSS 直聘。采集节奏已模拟人工；若弹出滑块验证请手动完成，会自动继续。薪资/JD 中如遇字体加密字符，插件会自动做字形识别解密，个别解不出的会显示 □。数据仅供个人求职/学习参考，请勿商用。
   </div>
 
   <script src="popup.js"></script>

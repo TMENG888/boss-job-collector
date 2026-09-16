@@ -22,6 +22,7 @@ let state = {
 };
 let activeTabId = null;
 let status = { status: 'IDLE', message: '空闲' };
+let stateLoaded = false;
 
 /* ---------- 状态持久化 ---------- */
 async function loadState() {
@@ -29,12 +30,56 @@ async function loadState() {
     const d = await chrome.storage.local.get(STATE_KEY);
     if (d[STATE_KEY]) state = Object.assign(state, d[STATE_KEY]);
   } catch (e) { /* ignore */ }
+  // 恢复非持久默认值（SW 休眠重启后不会丢失运行上下文）
+  status = { status: state.status || 'IDLE', message: state.message || '空闲' };
+  activeTabId = state.activeTabId || null;
+  stateLoaded = true;
 }
 function saveState() {
   return chrome.storage.local.set({ [STATE_KEY]: state }).catch(() => {});
 }
 
-loadState();
+function setStatus(s, m) {
+  status = { status: s, message: m };
+  if (stateLoaded) {
+    state.status = s;
+    state.message = m;
+    saveState();
+  }
+}
+
+(async () => {
+  await loadState();
+  // 浏览器刚启动（session 标志不存在）：沿用既有语义，不自动恢复任务
+  const { bootstrapped } = await chrome.storage.session.get('bootstrapped');
+  if (!bootstrapped) {
+    await chrome.storage.session.set({ bootstrapped: true });
+    return;
+  }
+  // SW 曾被休眠重启（浏览器未重启）：恢复正在进行的任务现场
+  if (state.running) {
+    try {
+      await chrome.tabs.get(activeTabId);
+    } catch (e) {
+      // 原标签页已丢失：重新打开搜索页
+      try {
+        const tab = await openSearchPage(state.searchUrl);
+        activeTabId = tab.id;
+        state.activeTabId = tab.id;
+        await saveState();
+      } catch (e2) {
+        state.running = false;
+        await saveState();
+        setStatus('STOPPED', '标签页已丢失，请重新开始采集');
+        return;
+      }
+    }
+    setStatus('RUN', '检测到任务曾被中断，已自动恢复采集…');
+    notifyTab(activeTabId, 'START', 1200, 30);
+  } else if (state.enrichScheduled && state.collected.length) {
+    scheduleEnrich(); // JD补全中断，重新调度
+  }
+})();
 
 // 浏览器重启后，未完成的任务视为失效
 chrome.runtime.onStartup.addListener(() => {
@@ -461,6 +506,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         try {
           const tab = await openSearchPage(state.searchUrl);
           activeTabId = tab.id;
+          state.activeTabId = tab.id;
+          await saveState();
           notifyTab(tab.id, 'START', 1000, 45);
         } catch (e) {
           setStatus('ERROR', '打开页面失败：' + e.message);
@@ -563,6 +610,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           );
           tabId = tab.id;
           activeTabId = tab.id;
+          state.activeTabId = tab.id;
+          await saveState();
         }
         setStatus('ENRICH', '开始补全JD详情（模拟真人点击进出详情页）…');
         scheduleEnrich();
