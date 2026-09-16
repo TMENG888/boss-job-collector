@@ -622,11 +622,26 @@
     };
   }
 
-  function fetchWithTimeout(url, ms) {
+  // fetch 整体超时（含响应体读取）：之前只保护到响应头，body 被 tarpit 拖住时
+  // res.text() 会无限挂起（实测卡死在第一条任务）。abort 定时器必须在 body 读完才解除
+  async function fetchHtmlWithTimeout(url, ms) {
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), ms);
-    return fetch(url, { credentials: 'include', signal: ctrl.signal })
-      .finally(() => clearTimeout(timer));
+    try {
+      const res = await fetch(url, { credentials: 'include', signal: ctrl.signal });
+      const html = await res.text(); // abort 触发时此处会以 AbortError 拒绝
+      return { ok: res.ok, status: res.status, url: res.url, html };
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
+  // 给可能长时间挂起的 promise 加硬超时（超时返回 fallback，绝不无限等待）
+  function withTimeout(p, ms, fallback) {
+    return Promise.race([
+      p,
+      new Promise((resolve) => setTimeout(() => resolve(fallback), ms))
+    ]);
   }
 
   // 终极兜底：真实标签页导航提取——由后台开一个真实详情页（active:false），
@@ -681,21 +696,20 @@
     if (!link) return { jd: '', salary: '', welfare: '', via: 'no-link' };
     const t0 = Date.now();
     try {
-      const res = await fetchWithTimeout(link, CONFIG.detailTimeout);
-      if (res.status === 403 || res.status === 429) {
+      const { ok, status, url: finalUrl, html } = await fetchHtmlWithTimeout(link, CONFIG.detailTimeout);
+      if (status === 403 || status === 429) {
         return { jd: '', salary: '', welfare: '', via: 'blocked', ms: Date.now() - t0 };
       }
-      if (res.ok) {
-        const html = await res.text();
+      if (ok) {
         const tm = html.match(/<title[^>]*>([^<]{0,80})<\/title>/i);
-        if (isBlockedDoc(tm ? tm[1] : '', res.url)) {
+        if (isBlockedDoc(tm ? tm[1] : '', finalUrl)) {
           return { jd: '', salary: '', welfare: '', via: 'blocked', ms: Date.now() - t0 };
         }
         const doc = new DOMParser().parseFromString(html, 'text/html');
         const d = extractDetail(doc);
         if (d.jd) return Object.assign({ via: 'fetch', ms: Date.now() - t0 }, d);
       }
-    } catch (e) { /* 超时或网络错误 */ }
+    } catch (e) { /* 超时（含body读超时）或网络错误 */ }
     return { jd: '', salary: '', welfare: '', via: 'fetch-empty', ms: Date.now() - t0 };
   }
 
@@ -722,7 +736,12 @@
     let detail = d;
     if (!d.jd && d.via !== 'blocked') {
       // fetch 拿不到 JD（BOSS 对程序化请求返回空壳）：降级为真实标签页导航提取
-      const r2 = await ask({ type: 'TAB_DETAIL', link: resp.job.link });
+      report('ENRICH', `fetch无内容，改真实详情页提取：${resp.job.name}`);
+      const r2 = await withTimeout(
+        ask({ type: 'TAB_DETAIL', link: resp.job.link }),
+        60000, // 硬超时：后台 tab 通道最坏 ~45s，超时则放弃本条，绝不允许 worker 永久卡死
+        null
+      );
       if (enrichAborted) return;
       if (r2 && r2.detail) detail = r2.detail;
     }
