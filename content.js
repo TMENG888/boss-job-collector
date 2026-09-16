@@ -550,6 +550,7 @@
     };
     // —— JD 提取（多层降级，每层结果需通过有效性检查才采纳）——
     let jd = '';
+    let jdVia = ''; // 命中层级（诊断用）
     const valid = (t) => t && t.length >= 50;
     try {
       // 层1：圈定 JD 模块容器 → 全部分块按文档序去重拼接（职责/任职要求分块不漏）
@@ -576,11 +577,12 @@
         }
         jd = parts.join('\n');
         if (!valid(jd)) jd = blockText(scope);
+        if (valid(jd)) jdVia = '层1容器拼接';
       }
       // 层2：老式直接命中（容器类名改版时仍可能命中分块本身）
       if (!valid(jd)) {
         const el = pick(SEL_DETAIL.jd);
-        if (el) jd = blockText(el);
+        if (el) { jd = blockText(el); jdVia = '层2选择器'; }
       }
       // 层3：关键词定位（不限 class，找包含职责/要求等关键词的最紧凑文本块）
       if (!valid(jd)) {
@@ -592,7 +594,7 @@
           if (hits) cands.push({ e, t, hits });
         }
         cands.sort((a, b) => (b.hits - a.hits) || (a.t.length - b.t.length));
-        if (cands.length) jd = blockText(cands[0].e);
+        if (cands.length) { jd = blockText(cands[0].e); jdVia = '层3关键词'; }
       }
       // 层4：最后兜底——取最大的 200~4500 字文本块（JD 通常是页面主内容区），
       // 但必须含岗位词汇，防止把导航/页脚等噪声当 JD
@@ -604,7 +606,7 @@
           if (t.length < 200 || t.length > 4500 || t.length <= bestLen) continue;
           if (/职责|任职|负责|熟悉|优先|经验|岗位/.test(t)) { best = e; bestLen = t.length; }
         }
-        if (best) jd = blockText(best);
+        if (best) { jd = blockText(best); jdVia = '层4兑底'; }
       }
     } catch (e) { /* 提取层任何异常都不应中断整条任务 */ }
     const salaryEl = pick(SEL_DETAIL.salary);
@@ -622,9 +624,8 @@
     };
   }
 
-  // 终极兜底：真实标签页导航提取——由后台开一个真实详情页（active:false），
-  // 页面内脚本等水合后提取。fetch/iframe 属程序化上下文，BOSS 可能返回空壳；
-  // 真实导航与用户点击行为一致，必然拿到完整渲染内容
+  // 页面内提取（由后台导航到详情页后调用）：轮询等水合，最多8s；
+  // 成功/失败都输出诊断（控制台可 F12 查看）
   async function extractDetailTab() {
     const t0 = Date.now();
     for (;;) {
@@ -640,23 +641,24 @@
           d.salary = FontDecoder.decodeText(d.salary);
           d.jd = FontDecoder.decodeText(d.jd);
         }
+        console.log(`[BOSS采集器] JD提取成功：${d.jdVia || '?'} · ${d.jd.length}字`);
         return Object.assign({ via: 'tab', ms: Date.now() - t0 }, d);
       }
       if (Date.now() - t0 > 8000) {
-        return Object.assign(
-          {
-            via: 'tab',
-            ms: Date.now() - t0,
-            diag: {
-              src: 'tab',
-              title: document.title || '',
-              url: location.href || '',
-              n: ((document.body && document.body.innerText) || '').length,
-              text: ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 120)
-            }
-          },
-          d
-        );
+        const body = (document.body && document.body.innerText) || '';
+        const diag = {
+          src: 'tab',
+          title: document.title || '',
+          url: location.href || '',
+          n: body.length,
+          text: body.replace(/\s+/g, ' ').slice(0, 120),
+          ready: document.readyState,
+          jobDesc: document.querySelectorAll('[class*="job-desc"]').length,
+          secText: document.querySelectorAll('[class*="job-sec-text"]').length,
+          pua: /[\ue000-\uf8ff]/.test(body)
+        };
+        console.log('[BOSS采集器] JD提取失败诊断：', diag);
+        return Object.assign({ via: 'tab', ms: Date.now() - t0 }, d, { diag });
       }
       await sleep(500);
     }
@@ -722,8 +724,14 @@
     } else if (msg.type === 'PING') {
       sendResponse({ ok: true, cards: findCards().length });
     } else if (msg.type === 'EXTRACT_DETAIL') {
-      // 真实详情页标签页内的提取请求（后台 tab 兜底通道）
-      extractDetailTab().then((detail) => sendResponse({ detail }));
+      // 详情页内的提取请求（后台热标签页通道）
+      try {
+        extractDetailTab().then((detail) => sendResponse({ detail }));
+      } catch (e) {
+        sendResponse({
+          detail: { jd: '', via: 'error', diag: { src: 'tab', title: '提取异常', url: location.href, n: 0, text: String((e && e.message) || e).slice(0, 120) } }
+        });
+      }
       return true; // 异步应答
     }
     return false;

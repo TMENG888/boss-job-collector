@@ -277,16 +277,33 @@ async function warmTabDetail(link) {
       };
     }
     await waitTabComplete(tabId, 15000);
-    // 页面内脚本等水合（最多8s）后提取；内容脚本未就绪则重试下发
-    let resp = null;
-    for (let i = 0; i < 3; i++) {
+    // 先探测内容脚本已注入（最多6×1s），再提取；避免把“未注入”误判成“提取为空”
+    let injected = false;
+    for (let i = 0; i < 6; i++) {
       try {
-        resp = await chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_DETAIL' });
-        if (resp && resp.detail && resp.detail.jd) break;
-      } catch (e) { /* 尚未就绪，稍后重试 */ }
-      await sleep(1500);
+        await chrome.tabs.sendMessage(tabId, { type: 'PING' });
+        injected = true;
+        break;
+      } catch (e) { await sleep(1000); }
     }
-    const d = (resp && resp.detail) || { jd: '', via: 'tab' };
+    let resp = null;
+    if (injected) {
+      // 页面内脚本等水合（最多8s）后提取；未取到则重试下发
+      for (let i = 0; i < 4; i++) {
+        try {
+          resp = await chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_DETAIL' });
+          if (resp && resp.detail && resp.detail.jd) break;
+        } catch (e) { /* 消息失败，稍后重试 */ }
+        await sleep(1500);
+      }
+    }
+    const d = (resp && resp.detail) || {
+      jd: '', via: 'tab',
+      diag: {
+        src: 'tab', title: injected ? '内容脚本已响应但无结果' : '内容脚本未注入/未响应',
+        url: link, n: 0, text: injected ? '多次提取均未返回JD' : '详情页已加载但消息未送达（检查扩展是否刚重载过，请刷新页面后重试）'
+      }
+    };
     d.ms = Date.now() - t0;
     return d;
   } catch (e) {
@@ -350,11 +367,11 @@ async function enrichLoop() {
       if (enrichStop) break;
       const done = state.collected.length - pendingCount();
       const tag = d.jd
-        ? ` · 上条 ${(d.ms / 1000).toFixed(1)}s`
+        ? ` · 上条 ${(d.ms / 1000).toFixed(1)}s · ${d.jdVia || ''}`
         : d.via === 'blocked'
           ? ' · ⚠安全验证未通过'
           : d.diag
-            ? ` · 页面:"${d.diag.title || '无标题'}"(${d.diag.n || '?'}字)`
+            ? ` · ${d.diag.title || '无标题'}(${d.diag.n || '?'}字)${d.diag.text ? ' ' + String(d.diag.text).slice(0, 60) : ''}`
             : ' · 未取到JD，稍后重试';
       setStatus('ENRICH', `JD获取中：已完成 ${done}/${state.collected.length}（还剩 ${pendingCount()}）${tag}`);
       if (d.via === 'blocked') {
