@@ -344,13 +344,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           j.area = j.area || d.area || '';
           sanitizeJob(j); // 终校验修复
           j.detailVia = d.via || '';
-          // 抓到实质内容才算完成；失败时释放领取标记，限次重试（最多 3 次）
+          // 抓到实质内容才算完成；失败时限次重试（最多 3 次）
+          // 无论成败都必须清 detailFetching：否则 60s 后 retryable() 会把已完成任务
+          // 重新判为"超时可重试"，worker 永远循环重抓最早一批任务（实测卡死在 9/100）
           j.detailTries = (j.detailTries || 0) + 1;
-          if (d.jd || d.via === 'iframe' || j.detailTries >= 3) {
-            j.detailFetched = true;
-          } else {
-            j.detailFetching = false;
-          }
+          if (d.jd || d.via === 'iframe' || j.detailTries >= 3) j.detailFetched = true;
+          j.detailFetching = false;
           const left = pendingCount();
           if (left > 0) {
             setStatus('ENRICH', `JD获取中：还剩 ${left} 条（已完成 ${state.collected.length - left}/${state.collected.length}）`);
