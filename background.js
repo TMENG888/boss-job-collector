@@ -352,7 +352,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           j.detailFetching = false;
           const left = pendingCount();
           if (left > 0) {
-            setStatus('ENRICH', `JD获取中：还剩 ${left} 条（已完成 ${state.collected.length - left}/${state.collected.length}）`);
+            const tag = d.via === 'blocked' ? ' · ⚠风控拦截' : d.ms ? ` · 上条 ${d.ms}ms` : '';
+            setStatus('ENRICH', `JD获取中：还剩 ${left} 条（已完成 ${state.collected.length - left}/${state.collected.length}）${tag}`);
           } else {
             state.enrichScheduled = false;
             setStatus('DONE', `全部完成 ✔ 共 ${state.collected.length} 条（含JD详情），可点击"导出CSV"`);

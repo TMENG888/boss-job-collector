@@ -622,7 +622,14 @@
       f.onload = () => {
         setTimeout(() => {
           try {
-            const d = extractDetail(f.contentDocument);
+            const doc = f.contentDocument;
+            if (BLOCKED_RE.test(doc.title || '') ||
+                (doc.body && BLOCKED_RE.test((doc.body.textContent || '').slice(0, 3000))) ||
+                /security-check/.test(f.contentWindow.location.href || '')) {
+              finish({ jd: '', salary: '', welfare: '', via: 'blocked' });
+              return;
+            }
+            const d = extractDetail(doc);
             finish(Object.assign({ via: 'iframe' }, d));
           } catch (e) {
             finish({ jd: '', salary: '', welfare: '', via: 'fail' });
@@ -635,20 +642,32 @@
     });
   }
 
+  // 风控拦截页特征（安全验证/滑块/验证码）：识别后快速放弃，不烧满超时预算
+  const BLOCKED_RE = /security-check|verify-slide|slider-verify|geetest|captcha|安全验证|验证码/i;
+
   async function fetchJobDetail(link) {
     if (!link) return { jd: '', salary: '', welfare: '', via: 'no-link' };
+    const t0 = Date.now();
     // 1) fetch + DOMParser（详情页是服务端渲染，HTML 里就有 JD）
     try {
       const res = await fetchWithTimeout(link, CONFIG.detailTimeout);
       if (res.ok) {
         const html = await res.text();
+        // 拦截页：同会话的 iframe 兜底只会加载同一张验证页，直接快速返回
+        if (BLOCKED_RE.test(html.slice(0, 6000)) || /security-check/.test(res.url || '')) {
+          return { jd: '', salary: '', welfare: '', via: 'blocked', ms: Date.now() - t0 };
+        }
         const doc = new DOMParser().parseFromString(html, 'text/html');
         const d = extractDetail(doc);
-        if (d.jd) return Object.assign({ via: 'fetch' }, d);
+        if (d.jd) return Object.assign({ via: 'fetch', ms: Date.now() - t0 }, d);
+      } else if (res.status === 403 || res.status === 429) {
+        return { jd: '', salary: '', welfare: '', via: 'blocked', ms: Date.now() - t0 };
       }
     } catch (e) { /* 被风控拦截或超时，走 iframe 兜底 */ }
     // 2) 同源 iframe 兜底
-    return iframeDetail(link);
+    const r = await iframeDetail(link);
+    r.ms = Date.now() - t0;
+    return r;
   }
 
   /* ================= JD 批量补全 ================= */
@@ -664,18 +683,32 @@
     return jdConcurrency;
   }
 
+  let blockedStreak = 0;
+  let pausedUntil = 0; // 熔断：连续被风控拦截时全体 worker 暂停到该时间点
+
   async function enrichOne(resp, slow) {
     if (enrichAborted) return;
     const d = await fetchJobDetail(resp.job.link);
     if (enrichAborted) return;
+    if (d.via === 'blocked') {
+      // 连续拦截说明已触发风控，硬冲只会加重：熔断暂停 90s
+      blockedStreak++;
+      if (blockedStreak >= 3 && Date.now() > pausedUntil) {
+        pausedUntil = Date.now() + 90000;
+        report('WARN', '连续疑似风控拦截，JD获取暂停90秒后自动重试；若页面出现滑块请手动完成');
+      }
+    } else if (d.jd) {
+      blockedStreak = 0;
+      pausedUntil = 0;
+    }
     if (FontDecoder.isPUA(d.salary) || FontDecoder.isPUA(d.jd)) {
       await FontDecoder.init(null);
       d.salary = FontDecoder.decodeText(d.salary);
       d.jd = FontDecoder.decodeText(d.jd);
     }
     fire({ type: 'JD_RESULT', key: resp.job.key, detail: d });
-    // 失败退避：请求异常/超时后额外多等一会，降低连击触发风控的概率
-    if (d.via === 'fail' || d.via === 'timeout') await sleep(2500 + Math.random() * 2000);
+    // 失败退避：请求异常/超时/被拦截后额外多等一会，降低连击触发风控的概率
+    if (d.via === 'fail' || d.via === 'timeout' || d.via === 'blocked') await sleep(2500 + Math.random() * 2000);
     await sleep(slow ? 700 + Math.random() * 900 : 300 + Math.random() * 300);
   }
 
@@ -686,6 +719,7 @@
       for (;;) {
         if (enrichAborted) return;
         if (budgetMs && Date.now() - t0 > budgetMs - 600) return;
+        if (Date.now() < pausedUntil) { await sleep(2000); continue; } // 熔断暂停中
         const resp = await ask({ type: 'GET_NEXT_PENDING' });
         if (!resp) { if (first) report('WARN', '与后台连接中断，JD获取已暂停'); return; }
         if (!resp.job) return;
