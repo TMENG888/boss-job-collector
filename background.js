@@ -178,6 +178,69 @@ function openSearchPage(url) {
   });
 }
 
+// —— 真实标签页导航提取（tab 兜底通道）——
+// fetch/iframe 是程序化上下文，BOSS 可能对其返回空壳；真实导航与用户点击行为一致。
+// 串行化：同时只开一个详情标签页（真实导航较重，且降低风控关注）
+let detailTabChain = Promise.resolve();
+
+function waitTabComplete(tabId, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      resolve(v);
+    };
+    const listener = (id, info) => {
+      if (id === tabId && info.status === 'complete') finish(true);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs
+      .get(tabId)
+      .then((t) => {
+        if (t.status === 'complete') finish(true);
+      })
+      .catch(() => finish(false));
+  });
+}
+
+function tabExtractDetail(link) {
+  const run = async () => {
+    let tab = null;
+    try {
+      tab = await chrome.tabs.create({ url: link, active: false });
+      await waitTabComplete(tab.id, 15000);
+      // 页面内脚本等水合（最多8s）后提取；内容脚本未就绪则重试下发
+      let resp = null;
+      for (let i = 0; i < 4; i++) {
+        try {
+          resp = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_DETAIL' });
+          if (resp && resp.detail && resp.detail.jd) break;
+        } catch (e) { /* 尚未就绪，稍后重试 */ }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+      return (
+        (resp && resp.detail) || { jd: '', salary: '', welfare: '', area: '', companyRaw: '', via: 'tab' }
+      );
+    } catch (e) {
+      return {
+        jd: '', salary: '', welfare: '', area: '', companyRaw: '', via: 'tab',
+        diag: { src: 'tab', title: '打开详情页失败', url: link, n: 0, text: String((e && e.message) || e).slice(0, 120) }
+      };
+    } finally {
+      if (tab && tab.id) {
+        try { await chrome.tabs.remove(tab.id); } catch (e) { /* ignore */ }
+      }
+    }
+  };
+  const p = detailTabChain.then(run, run);
+  detailTabChain = p.catch(() => {});
+  return p;
+}
+
 // 带重试的消息下发（content script 可能尚未就绪）
 function notifyTab(tabId, type, gapMs = 1200, maxTries = 40) {
   if (tabId == null) return;
@@ -306,6 +369,12 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       /* ---------- JD 详情补全 ---------- */
       case 'GET_CONCURRENCY': {
         sendResponse({ concurrency: state.concurrency || 1 });
+        break;
+      }
+      case 'TAB_DETAIL': {
+        // 真实标签页导航提取：详情请求拿不到内容时的终极兑底
+        const detail = await tabExtractDetail(String(msg.link || ''));
+        sendResponse({ detail });
         break;
       }
       case 'GET_NEXT_PENDING': {

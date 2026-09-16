@@ -582,17 +582,29 @@
         const el = pick(SEL_DETAIL.jd);
         if (el) jd = blockText(el);
       }
-      // 层3：关键词定位（不限 class，找包含职责/要求关键词的最紧凑文本块）
+      // 层3：关键词定位（不限 class，找包含职责/要求等关键词的最紧凑文本块）
       if (!valid(jd)) {
         const cands = [];
         for (const e of root.querySelectorAll('div,section')) {
           const t = e.textContent || '';
-          if (t.length < 80 || t.length > 5000) continue;
-          const hits = (t.match(/岗位职责|工作职责|职位描述|任职要求|工作内容|任职资格|岗位要求/g) || []).length;
+          if (t.length < 60 || t.length > 6000) continue;
+          const hits = (t.match(/岗位职责|工作职责|职位描述|任职要求|工作内容|任职资格|岗位要求|职责|工作要求/g) || []).length;
           if (hits) cands.push({ e, t, hits });
         }
         cands.sort((a, b) => (b.hits - a.hits) || (a.t.length - b.t.length));
         if (cands.length) jd = blockText(cands[0].e);
+      }
+      // 层4：最后兜底——取最大的 200~4500 字文本块（JD 通常是页面主内容区），
+      // 但必须含岗位词汇，防止把导航/页脚等噪声当 JD
+      if (!valid(jd)) {
+        let best = null;
+        let bestLen = 0;
+        for (const e of root.querySelectorAll('div,section')) {
+          const t = (e.textContent || '').trim();
+          if (t.length < 200 || t.length > 4500 || t.length <= bestLen) continue;
+          if (/职责|任职|负责|熟悉|优先|经验|岗位/.test(t)) { best = e; bestLen = t.length; }
+        }
+        if (best) jd = blockText(best);
       }
     } catch (e) { /* 提取层任何异常都不应中断整条任务 */ }
     const salaryEl = pick(SEL_DETAIL.salary);
@@ -617,56 +629,44 @@
       .finally(() => clearTimeout(timer));
   }
 
-  function iframeDetail(link) {
-    return new Promise((resolve) => {
-      let done = false;
-      const f = document.createElement('iframe');
-      f.style.cssText = 'position:fixed;left:-9999px;top:0;width:1200px;height:900px;';
-      const finish = (v) => {
-        if (done) return;
-        done = true;
-        try { f.remove(); } catch (e) { /* ignore */ }
-        resolve(v);
-      };
-      f.onload = () => {
-        setTimeout(() => {
-          try {
-            const doc = f.contentDocument;
-            if (isBlockedDoc(doc && doc.title, f.contentWindow.location.href)) {
-              finish({ jd: '', salary: '', welfare: '', via: 'blocked' });
-              return;
+  // 终极兜底：真实标签页导航提取——由后台开一个真实详情页（active:false），
+  // 页面内脚本等水合后提取。fetch/iframe 属程序化上下文，BOSS 可能返回空壳；
+  // 真实导航与用户点击行为一致，必然拿到完整渲染内容
+  async function extractDetailTab() {
+    const t0 = Date.now();
+    for (;;) {
+      let d;
+      try {
+        d = extractDetail(document);
+      } catch (e) {
+        d = { jd: '', salary: '', welfare: '', area: '', companyRaw: '' };
+      }
+      if (d.jd) {
+        if (FontDecoder.isPUA(d.salary) || FontDecoder.isPUA(d.jd)) {
+          await FontDecoder.init(null);
+          d.salary = FontDecoder.decodeText(d.salary);
+          d.jd = FontDecoder.decodeText(d.jd);
+        }
+        return Object.assign({ via: 'tab', ms: Date.now() - t0 }, d);
+      }
+      if (Date.now() - t0 > 8000) {
+        return Object.assign(
+          {
+            via: 'tab',
+            ms: Date.now() - t0,
+            diag: {
+              src: 'tab',
+              title: document.title || '',
+              url: location.href || '',
+              n: ((document.body && document.body.innerText) || '').length,
+              text: ((document.body && document.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 120)
             }
-            const mkDiag = () => ({
-              src: 'iframe',
-              title: (doc && doc.title) || '',
-              url: (f.contentWindow && f.contentWindow.location.href) || '',
-              n: ((doc && doc.body && doc.body.innerText) || '').length,
-              text: ((doc && doc.body && doc.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 120)
-            });
-            const d = extractDetail(doc);
-            if (!d.jd) {
-              // 客户端渲染可能慢于2.2s：再等一次重新提取，仍为空则带上页面指纹
-              setTimeout(() => {
-                try {
-                  const d2 = extractDetail(f.contentDocument);
-                  if (!d2.jd) d2.diag = mkDiag();
-                  finish(Object.assign({ via: 'iframe' }, d2));
-                } catch (e) {
-                  finish(Object.assign({ via: 'iframe' }, d, { diag: mkDiag() }));
-                }
-              }, 2000);
-              return;
-            }
-            finish(Object.assign({ via: 'iframe' }, d));
-          } catch (e) {
-            finish({ jd: '', salary: '', welfare: '', via: 'fail' });
-          }
-        }, 2200); // 等待客户端渲染
-      };
-      f.src = link;
-      document.body.appendChild(f);
-      setTimeout(() => finish({ jd: '', salary: '', welfare: '', via: 'timeout' }), 15000);
-    });
+          },
+          d
+        );
+      }
+      await sleep(500);
+    }
   }
 
   // 风控拦截页识别：只看高置信信号（<title> / 最终URL / 状态码）。
@@ -676,11 +676,10 @@
     return BLOCKED_TITLE_RE.test(String(title || '')) || /security-check/i.test(String(url || ''));
   }
 
+  // 快路径：fetch 程序化请求（服务端渲染时直接拿到 JD，最快）；拿不到则由 enrichOne 降级走真实标签页通道
   async function fetchJobDetail(link) {
     if (!link) return { jd: '', salary: '', welfare: '', via: 'no-link' };
     const t0 = Date.now();
-    let fetchDiag = null;
-    // 1) fetch + DOMParser（详情页是服务端渲染，HTML 里就有 JD）
     try {
       const res = await fetchWithTimeout(link, CONFIG.detailTimeout);
       if (res.status === 403 || res.status === 429) {
@@ -695,21 +694,9 @@
         const doc = new DOMParser().parseFromString(html, 'text/html');
         const d = extractDetail(doc);
         if (d.jd) return Object.assign({ via: 'fetch', ms: Date.now() - t0 }, d);
-        // fetch 拿到了页面但没有 JD：记录指纹供诊断（iframe 也失败时兜底上报）
-        fetchDiag = {
-          src: 'fetch',
-          title: tm ? tm[1] : '',
-          url: res.url,
-          n: ((doc.body && doc.body.textContent) || '').length,
-          text: ((doc.body && doc.body.textContent) || '').replace(/\s+/g, ' ').slice(0, 120)
-        };
       }
-    } catch (e) { /* 超时或网络错误，走 iframe 兜底 */ }
-    // 2) 同源 iframe 兜底
-    const r = await iframeDetail(link);
-    r.ms = Date.now() - t0;
-    if (!r.jd && !r.diag && fetchDiag) r.diag = fetchDiag;
-    return r;
+    } catch (e) { /* 超时或网络错误 */ }
+    return { jd: '', salary: '', welfare: '', via: 'fetch-empty', ms: Date.now() - t0 };
   }
 
   /* ================= JD 批量补全 ================= */
@@ -732,25 +719,32 @@
     if (enrichAborted) return;
     const d = await fetchJobDetail(resp.job.link);
     if (enrichAborted) return;
-    if (d.via === 'blocked') {
+    let detail = d;
+    if (!d.jd && d.via !== 'blocked') {
+      // fetch 拿不到 JD（BOSS 对程序化请求返回空壳）：降级为真实标签页导航提取
+      const r2 = await ask({ type: 'TAB_DETAIL', link: resp.job.link });
+      if (enrichAborted) return;
+      if (r2 && r2.detail) detail = r2.detail;
+    }
+    if (detail.via === 'blocked') {
       // 连续拦截说明已触发风控，硬冲只会加重：熔断暂停 90s
       blockedStreak++;
       if (blockedStreak >= 3 && Date.now() > pausedUntil) {
         pausedUntil = Date.now() + 90000;
         report('WARN', '连续疑似风控拦截，JD获取暂停90秒后自动重试；若页面出现滑块请手动完成');
       }
-    } else if (d.jd) {
+    } else if (detail.jd) {
       blockedStreak = 0;
       pausedUntil = 0;
     }
-    if (FontDecoder.isPUA(d.salary) || FontDecoder.isPUA(d.jd)) {
+    if (FontDecoder.isPUA(detail.salary) || FontDecoder.isPUA(detail.jd)) {
       await FontDecoder.init(null);
-      d.salary = FontDecoder.decodeText(d.salary);
-      d.jd = FontDecoder.decodeText(d.jd);
+      detail.salary = FontDecoder.decodeText(detail.salary);
+      detail.jd = FontDecoder.decodeText(detail.jd);
     }
-    fire({ type: 'JD_RESULT', key: resp.job.key, detail: d });
+    fire({ type: 'JD_RESULT', key: resp.job.key, detail });
     // 失败退避：请求异常/超时/被拦截后额外多等一会，降低连击触发风控的概率
-    if (d.via === 'fail' || d.via === 'timeout' || d.via === 'blocked') await sleep(2500 + Math.random() * 2000);
+    if (detail.via === 'fail' || detail.via === 'timeout' || detail.via === 'blocked') await sleep(2500 + Math.random() * 2000);
     await sleep(slow ? 700 + Math.random() * 900 : 300 + Math.random() * 300);
   }
 
@@ -855,6 +849,10 @@
       sendResponse({ ok: true });
     } else if (msg.type === 'PING') {
       sendResponse({ ok: true, cards: findCards().length });
+    } else if (msg.type === 'EXTRACT_DETAIL') {
+      // 真实详情页标签页内的提取请求（后台 tab 兜底通道）
+      extractDetailTab().then((detail) => sendResponse({ detail }));
+      return true; // 异步应答
     }
     return false;
   });
