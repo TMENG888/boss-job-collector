@@ -282,7 +282,26 @@ let enrichLoopRunning = false;
 let enrichStop = false;
 let blockedStreak = 0;
 let pausedUntil = 0; // 熔断：连续被风控拦截时暂停到该时间点
+// —— 拟人节奏引擎 ——
+let slowFactor = 1;      // 风控自适应减速：每次被拦截×1.5（上限4），每15条顺利×0.9（下限1）
+let jobsSinceBreak = 0;
+let nextBreakAt = 5 + Math.floor(Math.random() * 5); // 每5~9条随机长休一次
+let cleanJobs = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// 条间拟人间歇：基础4~9s × 减速因子；周期性插入30~90s长休（真人不会匀速刷几百条）
+async function pace() {
+  jobsSinceBreak++;
+  if (jobsSinceBreak >= nextBreakAt) {
+    const brk = 30000 + Math.random() * 60000;
+    setStatus('ENRICH', `已连续采集 ${jobsSinceBreak} 条，模拟真人休息 ${Math.round(brk / 1000)}s 后继续…`);
+    jobsSinceBreak = 0;
+    nextBreakAt = 5 + Math.floor(Math.random() * 5);
+    await sleep(brk);
+    return;
+  }
+  await sleep((4000 + Math.random() * 5000) * slowFactor);
+}
 
 async function tabTitle(tabId) {
   try {
@@ -322,6 +341,8 @@ async function warmTabDetail(link) {
       };
     }
     await waitTabComplete(tabId, 15000);
+    // 模拟真人阅读JD：在详情页停留片刻再返回列表（停留过短本身就是机器人特征）
+    await sleep(1500 + Math.random() * 3000);
     // 先探测内容脚本已注入（最多6×1s），再提取；避免把“未注入”误判成“提取为空”
     let injected = false;
     for (let i = 0; i < 6; i++) {
@@ -430,15 +451,23 @@ async function enrichLoop() {
       setStatus('ENRICH', `JD获取中：已完成 ${done}/${state.collected.length}（还剩 ${pendingCount()}）${tag}`);
       if (d.via === 'blocked') {
         blockedStreak++;
+        slowFactor = Math.min(4, slowFactor * 1.5); // 被拦截立即整体减速
+        if (blockedStreak === 1) {
+          // 首次拦截就冷却：封禁期间继续请求只会延长封禁
+          setStatus('WARN', '遇到风控拦截，冷却30~60秒后继续（已自动降低整体速度）…');
+          await sleep(30000 + Math.random() * 30000);
+        }
         if (blockedStreak >= 3 && Date.now() > pausedUntil) {
           pausedUntil = Date.now() + 90000;
           setStatus('WARN', '连续遇到安全验证，暂停90秒后自动重试；若页面有滑块请手动完成');
         }
       } else if (d.jd) {
         blockedStreak = 0;
+        cleanJobs++;
+        if (cleanJobs % 15 === 0) slowFactor = Math.max(1, slowFactor * 0.9); // 顺利时缓慢恢复速度
         pausedUntil = 0;
       }
-      await sleep(1200 + Math.random() * 1500); // 模拟真人翻看节奏
+      await pace(); // 拟人节奏：条间间歇 + 周期性长休
     }
     state.enrichScheduled = false;
     await saveState();

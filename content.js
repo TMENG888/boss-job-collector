@@ -16,7 +16,7 @@
 
   /* ================= 可配置参数 ================= */
   const CONFIG = {
-    pageDelay: [4000, 8000],    // 翻页之间随机停留区间（毫秒），模拟人工
+    pageDelay: [6000, 13000],   // 翻页之间随机停留区间（毫秒）。过快会触发 IP 风控
     scrollDelay: 350,           // 滚动步进间隔（毫秒）
     cardWaitTimeout: 20000,     // 等待岗位卡片渲染的超时
     pageChangeTimeout: 15000,   // 翻页后等待列表变化的超时
@@ -648,6 +648,17 @@
       } catch (e) {
         d = { jd: '', salary: '', welfare: '', area: '', companyRaw: '' };
       }
+      // IP 级封禁页检测：标题仍是"BOSS直聘"，只能看正文特征。
+      // 必须立即上报停止重试——封禁期间继续请求只会延长封禁
+      const bodyNow = (document.body && document.body.innerText) || '';
+      if (/访问受限|IP\s*存在异常|暂时被禁止访问/.test(bodyNow)) {
+        const diag = {
+          src: 'tab', title: '访问受限(IP风控)', url: location.href,
+          n: bodyNow.length, text: bodyNow.replace(/\s+/g, ' ').slice(0, 120)
+        };
+        console.log('[BOSS采集器] IP 被限制访问：', diag);
+        return Object.assign({ via: 'blocked', ms: Date.now() - t0 }, d, { diag });
+      }
       if (d.jd) {
         if (FontDecoder.isPUA(d.salary) || FontDecoder.isPUA(d.jd)) {
           await FontDecoder.init(null);
@@ -700,6 +711,8 @@
             report('WAIT_CAPTCHA', '检测到安全验证，请在页面上手动完成，完成后自动继续…');
             if (await waitCaptchaGone()) continue;
             report('ERROR', '等待安全验证超时，已停止');
+          } else if (/访问受限|暂时被禁止访问/.test((document.body && document.body.innerText) || '')) {
+            report('ERROR', 'IP 已被 BOSS 限制访问（"访问受限"页）。请等限制解除（页面有恢复时间）再重新开始；已采数据可先导出');
           } else {
             report('ERROR', '未找到岗位列表：请确认已登录，且当前页面是职位搜索结果页');
           }
@@ -718,6 +731,11 @@
         }
         pageNo++;
         await sleep(CONFIG.pageDelay[0] + Math.random() * (CONFIG.pageDelay[1] - CONFIG.pageDelay[0])); // 模拟人工翻页节奏
+        if (Math.random() < 0.25) {
+          const long = 12000 + Math.random() * 18000; // 约四分之一翻页后长休一次，避免匀速高频触发风控
+          report('RUN', `已连续翻页多页，模拟真人休息 ${Math.round(long / 1000)}s…`);
+          await sleep(long);
+        }
       }
     } catch (e) {
       report('ERROR', '运行出错：' + (e && e.message));
