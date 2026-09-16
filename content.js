@@ -22,7 +22,7 @@
     pageChangeTimeout: 15000,   // 翻页后等待列表变化的超时
     captchaWaitTimeout: 180000, // 等待人工完成安全验证的超时
     maxScrollSteps: 60,         // 单页最大滚动步数
-    detailTimeout: 12000,       // 详情页 fetch 超时
+    detailTimeout: 8000,        // 详情页 fetch 超时（正常页几百ms返回；挂死时快速放弃）
     jdDelay: [700, 1600]        // 逐条获取JD的间隔
   };
 
@@ -623,9 +623,7 @@
         setTimeout(() => {
           try {
             const doc = f.contentDocument;
-            if (BLOCKED_RE.test(doc.title || '') ||
-                (doc.body && BLOCKED_RE.test((doc.body.textContent || '').slice(0, 3000))) ||
-                /security-check/.test(f.contentWindow.location.href || '')) {
+            if (isBlockedDoc(doc && doc.title, f.contentWindow.location.href)) {
               finish({ jd: '', salary: '', welfare: '', via: 'blocked' });
               return;
             }
@@ -634,16 +632,20 @@
           } catch (e) {
             finish({ jd: '', salary: '', welfare: '', via: 'fail' });
           }
-        }, 2200); // 等待客户端渲染（HR/活跃度区块是 JS 注入的）
+        }, 2200); // 等待客户端渲染
       };
       f.src = link;
       document.body.appendChild(f);
-      setTimeout(() => finish({ jd: '', salary: '', welfare: '', via: 'timeout' }), 20000);
+      setTimeout(() => finish({ jd: '', salary: '', welfare: '', via: 'timeout' }), 15000);
     });
   }
 
-  // 风控拦截页特征（安全验证/滑块/验证码）：识别后快速放弃，不烧满超时预算
-  const BLOCKED_RE = /security-check|verify-slide|slider-verify|geetest|captcha|安全验证|验证码/i;
+  // 风控拦截页识别：只看高置信信号（<title> / 最终URL / 状态码）。
+  // 不要扫正文与脚本——正常页面的 head 里常含 captcha/geetest 等 SDK 字样，会全部误判
+  const BLOCKED_TITLE_RE = /安全验证|验证码|滑动验证|滑块验证|security.?check/i;
+  function isBlockedDoc(title, url) {
+    return BLOCKED_TITLE_RE.test(String(title || '')) || /security-check/i.test(String(url || ''));
+  }
 
   async function fetchJobDetail(link) {
     if (!link) return { jd: '', salary: '', welfare: '', via: 'no-link' };
@@ -651,19 +653,20 @@
     // 1) fetch + DOMParser（详情页是服务端渲染，HTML 里就有 JD）
     try {
       const res = await fetchWithTimeout(link, CONFIG.detailTimeout);
+      if (res.status === 403 || res.status === 429) {
+        return { jd: '', salary: '', welfare: '', via: 'blocked', ms: Date.now() - t0 };
+      }
       if (res.ok) {
         const html = await res.text();
-        // 拦截页：同会话的 iframe 兜底只会加载同一张验证页，直接快速返回
-        if (BLOCKED_RE.test(html.slice(0, 6000)) || /security-check/.test(res.url || '')) {
+        const tm = html.match(/<title[^>]*>([^<]{0,80})<\/title>/i);
+        if (isBlockedDoc(tm ? tm[1] : '', res.url)) {
           return { jd: '', salary: '', welfare: '', via: 'blocked', ms: Date.now() - t0 };
         }
         const doc = new DOMParser().parseFromString(html, 'text/html');
         const d = extractDetail(doc);
         if (d.jd) return Object.assign({ via: 'fetch', ms: Date.now() - t0 }, d);
-      } else if (res.status === 403 || res.status === 429) {
-        return { jd: '', salary: '', welfare: '', via: 'blocked', ms: Date.now() - t0 };
       }
-    } catch (e) { /* 被风控拦截或超时，走 iframe 兜底 */ }
+    } catch (e) { /* 超时或网络错误，走 iframe 兜底 */ }
     // 2) 同源 iframe 兜底
     const r = await iframeDetail(link);
     r.ms = Date.now() - t0;
