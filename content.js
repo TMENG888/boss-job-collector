@@ -686,7 +686,7 @@
 
   // 风控拦截页识别：只看高置信信号（<title> / 最终URL / 状态码）。
   // 不要扫正文与脚本——正常页面的 head 里常含 captcha/geetest 等 SDK 字样，会全部误判
-  const BLOCKED_TITLE_RE = /安全验证|验证码|滑动验证|滑块验证|security.?check/i;
+  const BLOCKED_TITLE_RE = /安全验证|验证码|滑动验证|滑块验证|security.?check|请稍候/i;
   function isBlockedDoc(title, url) {
     return BLOCKED_TITLE_RE.test(String(title || '')) || /security-check/i.test(String(url || ''));
   }
@@ -697,6 +697,10 @@
     const t0 = Date.now();
     try {
       const { ok, status, url: finalUrl, html } = await fetchHtmlWithTimeout(link, CONFIG.detailTimeout);
+      if (/security\.html|passport\/zp\/security/i.test(finalUrl)) {
+        // 安检重定向：实测每次程序化请求都被 302 到 JS 质询页，fetch 无法通过
+        return { jd: '', salary: '', welfare: '', via: 'security', ms: Date.now() - t0 };
+      }
       if (status === 403 || status === 429) {
         return { jd: '', salary: '', welfare: '', via: 'blocked', ms: Date.now() - t0 };
       }
@@ -728,18 +732,33 @@
 
   let blockedStreak = 0;
   let pausedUntil = 0; // 熔断：连续被风控拦截时全体 worker 暂停到该时间点
+  let fetchGated = false; // 连续被安检重定向后跳过 fetch，直接走真实标签页通道
+  let securityStreak = 0;
 
   async function enrichOne(resp, slow) {
     if (enrichAborted) return;
-    const d = await fetchJobDetail(resp.job.link);
-    if (enrichAborted) return;
+    let d;
+    if (fetchGated) {
+      // 连续被安检重定向后，fetch 必然失败，直接跳过省时间
+      d = { jd: '', salary: '', welfare: '', via: 'security', ms: 0 };
+    } else {
+      d = await fetchJobDetail(resp.job.link);
+      if (enrichAborted) return;
+      if (d.via === 'security') {
+        securityStreak++;
+        if (securityStreak >= 2) fetchGated = true;
+      } else if (d.jd) {
+        securityStreak = 0;
+        fetchGated = false;
+      }
+    }
     let detail = d;
     if (!d.jd && d.via !== 'blocked') {
-      // fetch 拿不到 JD（BOSS 对程序化请求返回空壳）：降级为真实标签页导航提取
-      report('ENRICH', `fetch无内容，改真实详情页提取：${resp.job.name}`);
+      // 安检质询只有真实页面能过（JS算令牌后重定向回详情页）：真实标签页是唯一通道
+      report('ENRICH', `改真实详情页提取（过安检）：${resp.job.name}`);
       const r2 = await withTimeout(
         ask({ type: 'TAB_DETAIL', link: resp.job.link }),
-        60000, // 硬超时：后台 tab 通道最坏 ~45s，超时则放弃本条，绝不允许 worker 永久卡死
+        90000, // 硬超时：安检链(最多25s)+加载(15s)+水合提取，绝不允许 worker 永久卡死
         null
       );
       if (enrichAborted) return;

@@ -207,16 +207,42 @@ function waitTabComplete(tabId, timeoutMs) {
   });
 }
 
+function waitTabUrl(tabId, test, timeoutMs) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      chrome.tabs.onUpdated.removeListener(listener);
+      clearTimeout(timer);
+      resolve(v);
+    };
+    const listener = (id, info, tab) => {
+      if (id === tabId && test(info.url || (tab && tab.url) || '')) finish(true);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    chrome.tabs.onUpdated.addListener(listener);
+    chrome.tabs
+      .get(tabId)
+      .then((t) => {
+        if (test(t.url)) finish(true);
+      })
+      .catch(() => finish(false));
+  });
+}
+
 function tabExtractDetail(link) {
   const run = async () => {
     let tab = null;
     try {
       tab = await chrome.tabs.create({ url: link, active: false });
-      await waitTabComplete(tab.id, 15000);
+      // 安检链：security.html(JS算令牌)→重定向回 job_detail。等 URL 落位（最多25s）
+      const landed = await waitTabUrl(tab.id, (u) => /job_detail\//.test(u || ''), 25000);
+      if (landed) await waitTabComplete(tab.id, 15000);
       // 页面内脚本等水合（最多8s）后提取；内容脚本未就绪则重试下发
-      // 整体预算 ~40s，必须小于 content 侧 TAB_DETAIL 的 60s 硬超时
+      // 整体预算 ~55s，小于 content 侧 TAB_DETAIL 的 90s 硬超时
       let resp = null;
-      for (let i = 0; i < 3; i++) {
+      for (let i = 0; i < 2; i++) {
         try {
           resp = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_DETAIL' });
           if (resp && resp.detail && resp.detail.jd) break;
