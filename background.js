@@ -344,15 +344,21 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           j.area = j.area || d.area || '';
           sanitizeJob(j); // 终校验修复
           j.detailVia = d.via || '';
-          // 抓到实质内容才算完成；失败时限次重试（最多 3 次）
-          // 无论成败都必须清 detailFetching：否则 60s 后 retryable() 会把已完成任务
-          // 重新判为"超时可重试"，worker 永远循环重抓最早一批任务（实测卡死在 9/100）
+          // 诊断：拿不到 JD 时记录实际返回的页面指纹（登录墙/空壳/重定向一眼可见）
+          if (!d.jd && d.diag) j.detailDiag = d.diag;
+          // 只有真抓到 JD 才算完成（空结果重试，最多 3 次）；无论成败都清 detailFetching，
+          // 否则 60s 后 retryable() 会把任务误判为超时可重试，worker 死循环重抓最早一批
           j.detailTries = (j.detailTries || 0) + 1;
-          if (d.jd || d.via === 'iframe' || j.detailTries >= 3) j.detailFetched = true;
+          if (d.jd || j.detailTries >= 3) j.detailFetched = true;
           j.detailFetching = false;
           const left = pendingCount();
           if (left > 0) {
-            const tag = d.via === 'blocked' ? ' · ⚠风控拦截' : d.ms ? ` · 上条 ${d.ms}ms` : '';
+            const dg = d.diag;
+            const tag = dg
+              ? ` · 页面:"${dg.title || '无标题'}"(${dg.n || '?'}字)`
+              : d.via === 'blocked'
+                ? ' · ⚠风控拦截'
+                : d.ms ? ` · 上条 ${d.ms}ms` : '';
             setStatus('ENRICH', `JD获取中：还剩 ${left} 条（已完成 ${state.collected.length - left}/${state.collected.length}）${tag}`);
           } else {
             state.enrichScheduled = false;

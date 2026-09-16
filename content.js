@@ -548,44 +548,53 @@
       }
       return null;
     };
-    // JD 提取：职责/任职要求常被拆成多个分块，只取第一个会缺漏（CSV 实测约1/3缺“任职要求”）
-    // 策略：圈定 JD 模块容器避免混入侧栏公司简介 → 收集全部分块 → 只留最内层 → 按文档序去重拼接
-    const scope =
-      root.querySelector('[class*="job-desc"]') ||
-      root.querySelector('.job-detail-section') ||
-      root.querySelector('.detail-content');
+    // —— JD 提取（多层降级，每层结果需通过有效性检查才采纳）——
     let jd = '';
-    if (scope) {
-      const blocks = [];
-      for (const s of SEL_DETAIL.jd) {
-        qsa(s, scope).forEach((el) => {
-          const t = (el.textContent || '').trim();
-          if (t.length > 15) blocks.push(el);
-        });
+    const valid = (t) => t && t.length >= 50;
+    try {
+      // 层1：圈定 JD 模块容器 → 全部分块按文档序去重拼接（职责/任职要求分块不漏）
+      const scope =
+        root.querySelector('[class*="job-desc"]') ||
+        root.querySelector('.job-detail-section') ||
+        root.querySelector('.detail-content');
+      if (scope) {
+        const blocks = [];
+        for (const s of SEL_DETAIL.jd) {
+          qsa(s, scope).forEach((el) => {
+            const t = (el.textContent || '').trim();
+            if (t.length > 15) blocks.push(el);
+          });
+        }
+        const leaves = blocks.filter((el) => !blocks.some((o) => o !== el && el.contains(o)));
+        leaves.sort((a, b) =>
+          a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+        );
+        const parts = [];
+        for (const el of leaves) {
+          const t = blockText(el);
+          if (t && !parts.includes(t)) parts.push(t);
+        }
+        jd = parts.join('\n');
+        if (!valid(jd)) jd = blockText(scope);
       }
-      const leaves = blocks.filter((el) => !blocks.some((o) => o !== el && el.contains(o)));
-      leaves.sort((a, b) =>
-        a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
-      );
-      const parts = [];
-      for (const el of leaves) {
-        const t = blockText(el);
-        if (t && !parts.includes(t)) parts.push(t);
+      // 层2：老式直接命中（容器类名改版时仍可能命中分块本身）
+      if (!valid(jd)) {
+        const el = pick(SEL_DETAIL.jd);
+        if (el) jd = blockText(el);
       }
-      jd = parts.join('\n') || blockText(scope);
-    }
-    if (!jd) {
-      // 兜底：找包含 JD 关键词的文本块
-      const kwBlocks = Array.from(root.querySelectorAll('div,section')).filter(
-        (e) => e.textContent && e.textContent.length > 120
-      );
-      const kw = kwBlocks.find(
-        (e) =>
-          /岗位职责|工作职责|职位描述|任职要求|工作内容/.test(e.textContent) &&
-          e.children.length < 8
-      );
-      if (kw) jd = blockText(kw);
-    }
+      // 层3：关键词定位（不限 class，找包含职责/要求关键词的最紧凑文本块）
+      if (!valid(jd)) {
+        const cands = [];
+        for (const e of root.querySelectorAll('div,section')) {
+          const t = e.textContent || '';
+          if (t.length < 80 || t.length > 5000) continue;
+          const hits = (t.match(/岗位职责|工作职责|职位描述|任职要求|工作内容|任职资格|岗位要求/g) || []).length;
+          if (hits) cands.push({ e, t, hits });
+        }
+        cands.sort((a, b) => (b.hits - a.hits) || (a.t.length - b.t.length));
+        if (cands.length) jd = blockText(cands[0].e);
+      }
+    } catch (e) { /* 提取层任何异常都不应中断整条任务 */ }
     const salaryEl = pick(SEL_DETAIL.salary);
     const areaEl = pick(SEL_DETAIL.area);
     const welfare = qsa(SEL_DETAIL.welfare, root).map(txt).filter(Boolean).join('、');
@@ -593,7 +602,7 @@
     // 公司信息块保留换行，供后台按 token 解析公司名/行业/规模/融资
     const raw = compEl ? String(compEl.innerText || compEl.textContent || '') : '';
     return {
-      jd: jd.slice(0, 5000),
+      jd: String(jd || '').slice(0, 5000),
       salary: salaryEl ? txt(salaryEl) : '',
       welfare,
       area: areaEl ? txt(areaEl) : '',
@@ -627,7 +636,27 @@
               finish({ jd: '', salary: '', welfare: '', via: 'blocked' });
               return;
             }
+            const mkDiag = () => ({
+              src: 'iframe',
+              title: (doc && doc.title) || '',
+              url: (f.contentWindow && f.contentWindow.location.href) || '',
+              n: ((doc && doc.body && doc.body.innerText) || '').length,
+              text: ((doc && doc.body && doc.body.innerText) || '').replace(/\s+/g, ' ').slice(0, 120)
+            });
             const d = extractDetail(doc);
+            if (!d.jd) {
+              // 客户端渲染可能慢于2.2s：再等一次重新提取，仍为空则带上页面指纹
+              setTimeout(() => {
+                try {
+                  const d2 = extractDetail(f.contentDocument);
+                  if (!d2.jd) d2.diag = mkDiag();
+                  finish(Object.assign({ via: 'iframe' }, d2));
+                } catch (e) {
+                  finish(Object.assign({ via: 'iframe' }, d, { diag: mkDiag() }));
+                }
+              }, 2000);
+              return;
+            }
             finish(Object.assign({ via: 'iframe' }, d));
           } catch (e) {
             finish({ jd: '', salary: '', welfare: '', via: 'fail' });
@@ -650,6 +679,7 @@
   async function fetchJobDetail(link) {
     if (!link) return { jd: '', salary: '', welfare: '', via: 'no-link' };
     const t0 = Date.now();
+    let fetchDiag = null;
     // 1) fetch + DOMParser（详情页是服务端渲染，HTML 里就有 JD）
     try {
       const res = await fetchWithTimeout(link, CONFIG.detailTimeout);
@@ -665,11 +695,20 @@
         const doc = new DOMParser().parseFromString(html, 'text/html');
         const d = extractDetail(doc);
         if (d.jd) return Object.assign({ via: 'fetch', ms: Date.now() - t0 }, d);
+        // fetch 拿到了页面但没有 JD：记录指纹供诊断（iframe 也失败时兜底上报）
+        fetchDiag = {
+          src: 'fetch',
+          title: tm ? tm[1] : '',
+          url: res.url,
+          n: ((doc.body && doc.body.textContent) || '').length,
+          text: ((doc.body && doc.body.textContent) || '').replace(/\s+/g, ' ').slice(0, 120)
+        };
       }
     } catch (e) { /* 超时或网络错误，走 iframe 兜底 */ }
     // 2) 同源 iframe 兜底
     const r = await iframeDetail(link);
     r.ms = Date.now() - t0;
+    if (!r.jd && !r.diag && fetchDiag) r.diag = fetchDiag;
     return r;
   }
 
