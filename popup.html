@@ -64,16 +64,8 @@
   </div>
 
   <div class="row">
-    <label>JD详情并发数（越高越快，也越容易触发风控）</label>
-    <select id="concurrency">
-      <option value="1">1（稳妥 · 约1条/秒）</option>
-      <option value="2">2（推荐 · 约2条/秒）</option>
-      <option value="3">3（较快）</option>
-      <option value="4">4</option>
-      <option value="5">5</option>
-      <option value="6">6（激进 · 易触发滑块）</option>
-    </select>
-    <div class="hint">并发越高越快，也越容易触发风控。建议 1~3，新账号用 1；连续被拦截会自动暂停90秒再试</div>
+    <label>JD详情采集方式</label>
+    <div class="hint">模拟真人点击：复用当前已登录的标签页逐条进出详情页（一次一条，最稳）；采集期间请保持窗口可见，若弹出滑块请手动完成，完成后自动继续</div>
   </div>
 
   <div class="row checkbox-row">

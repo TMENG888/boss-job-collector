@@ -622,28 +622,6 @@
     };
   }
 
-  // fetch 整体超时（含响应体读取）：之前只保护到响应头，body 被 tarpit 拖住时
-  // res.text() 会无限挂起（实测卡死在第一条任务）。abort 定时器必须在 body 读完才解除
-  async function fetchHtmlWithTimeout(url, ms) {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), ms);
-    try {
-      const res = await fetch(url, { credentials: 'include', signal: ctrl.signal });
-      const html = await res.text(); // abort 触发时此处会以 AbortError 拒绝
-      return { ok: res.ok, status: res.status, url: res.url, html };
-    } finally {
-      clearTimeout(timer);
-    }
-  }
-
-  // 给可能长时间挂起的 promise 加硬超时（超时返回 fallback，绝不无限等待）
-  function withTimeout(p, ms, fallback) {
-    return Promise.race([
-      p,
-      new Promise((resolve) => setTimeout(() => resolve(fallback), ms))
-    ]);
-  }
-
   // 终极兜底：真实标签页导航提取——由后台开一个真实详情页（active:false），
   // 页面内脚本等水合后提取。fetch/iframe 属程序化上下文，BOSS 可能返回空壳；
   // 真实导航与用户点击行为一致，必然拿到完整渲染内容
@@ -691,145 +669,6 @@
     return BLOCKED_TITLE_RE.test(String(title || '')) || /security-check/i.test(String(url || ''));
   }
 
-  // 快路径：fetch 程序化请求（服务端渲染时直接拿到 JD，最快）；拿不到则由 enrichOne 降级走真实标签页通道
-  async function fetchJobDetail(link) {
-    if (!link) return { jd: '', salary: '', welfare: '', via: 'no-link' };
-    const t0 = Date.now();
-    try {
-      const { ok, status, url: finalUrl, html } = await fetchHtmlWithTimeout(link, CONFIG.detailTimeout);
-      if (/security\.html|passport\/zp\/security/i.test(finalUrl)) {
-        // 安检重定向：实测每次程序化请求都被 302 到 JS 质询页，fetch 无法通过
-        return { jd: '', salary: '', welfare: '', via: 'security', ms: Date.now() - t0 };
-      }
-      if (status === 403 || status === 429) {
-        return { jd: '', salary: '', welfare: '', via: 'blocked', ms: Date.now() - t0 };
-      }
-      if (ok) {
-        const tm = html.match(/<title[^>]*>([^<]{0,80})<\/title>/i);
-        if (isBlockedDoc(tm ? tm[1] : '', finalUrl)) {
-          return { jd: '', salary: '', welfare: '', via: 'blocked', ms: Date.now() - t0 };
-        }
-        const doc = new DOMParser().parseFromString(html, 'text/html');
-        const d = extractDetail(doc);
-        if (d.jd) return Object.assign({ via: 'fetch', ms: Date.now() - t0 }, d);
-      }
-    } catch (e) { /* 超时（含body读超时）或网络错误 */ }
-    return { jd: '', salary: '', welfare: '', via: 'fetch-empty', ms: Date.now() - t0 };
-  }
-
-  /* ================= JD 批量补全 ================= */
-  let enriching = false;
-  let enrichAborted = false;
-  let jdConcurrency = 1;
-
-  async function getConcurrency() {
-    try {
-      const resp = await ask({ type: 'GET_CONCURRENCY' });
-      if (resp && resp.concurrency) jdConcurrency = Math.max(1, Math.min(6, resp.concurrency | 0));
-    } catch (e) { /* 后台休眠等异常时沿用当前值 */ }
-    return jdConcurrency;
-  }
-
-  let blockedStreak = 0;
-  let pausedUntil = 0; // 熔断：连续被风控拦截时全体 worker 暂停到该时间点
-  let fetchGated = false; // 连续被安检重定向后跳过 fetch，直接走真实标签页通道
-  let securityStreak = 0;
-
-  async function enrichOne(resp, slow) {
-    if (enrichAborted) return;
-    let d;
-    if (fetchGated) {
-      // 连续被安检重定向后，fetch 必然失败，直接跳过省时间
-      d = { jd: '', salary: '', welfare: '', via: 'security', ms: 0 };
-    } else {
-      d = await fetchJobDetail(resp.job.link);
-      if (enrichAborted) return;
-      if (d.via === 'security') {
-        securityStreak++;
-        if (securityStreak >= 2) fetchGated = true;
-      } else if (d.jd) {
-        securityStreak = 0;
-        fetchGated = false;
-      }
-    }
-    let detail = d;
-    if (!d.jd && d.via !== 'blocked') {
-      // 安检质询只有真实页面能过（JS算令牌后重定向回详情页）：真实标签页是唯一通道
-      report('ENRICH', `改真实详情页提取（过安检）：${resp.job.name}`);
-      const r2 = await withTimeout(
-        ask({ type: 'TAB_DETAIL', link: resp.job.link }),
-        90000, // 硬超时：安检链(最多25s)+加载(15s)+水合提取，绝不允许 worker 永久卡死
-        null
-      );
-      if (enrichAborted) return;
-      if (r2 && r2.detail) detail = r2.detail;
-    }
-    if (detail.via === 'blocked') {
-      // 连续拦截说明已触发风控，硬冲只会加重：熔断暂停 90s
-      blockedStreak++;
-      if (blockedStreak >= 3 && Date.now() > pausedUntil) {
-        pausedUntil = Date.now() + 90000;
-        report('WARN', '连续疑似风控拦截，JD获取暂停90秒后自动重试；若页面出现滑块请手动完成');
-      }
-    } else if (detail.jd) {
-      blockedStreak = 0;
-      pausedUntil = 0;
-    }
-    if (FontDecoder.isPUA(detail.salary) || FontDecoder.isPUA(detail.jd)) {
-      await FontDecoder.init(null);
-      detail.salary = FontDecoder.decodeText(detail.salary);
-      detail.jd = FontDecoder.decodeText(detail.jd);
-    }
-    fire({ type: 'JD_RESULT', key: resp.job.key, detail });
-    // 失败退避：请求异常/超时/被拦截后额外多等一会，降低连击触发风控的概率
-    if (detail.via === 'fail' || detail.via === 'timeout' || detail.via === 'blocked') await sleep(2500 + Math.random() * 2000);
-    await sleep(slow ? 700 + Math.random() * 900 : 300 + Math.random() * 300);
-  }
-
-  // 并发池：n 个 worker 各自领任务→抓取→上报；后台领任务时同步标记，天然防重复
-  async function runEnrichPool(budgetMs, t0) {
-    const n = await getConcurrency();
-    const worker = async (first) => {
-      for (;;) {
-        if (enrichAborted) return;
-        if (budgetMs && Date.now() - t0 > budgetMs - 600) return;
-        if (Date.now() < pausedUntil) { await sleep(2000); continue; } // 熔断暂停中
-        const resp = await ask({ type: 'GET_NEXT_PENDING' });
-        if (!resp) { if (first) report('WARN', '与后台连接中断，JD获取已暂停'); return; }
-        if (!resp.job) return;
-        if (first && !budgetMs && resp.pending % 10 === 0)
-          report('ENRICH', `获取JD详情（剩 ${resp.pending} 条）：${resp.job.name}`);
-        await enrichOne(resp, !budgetMs);
-      }
-    };
-    const ws = [];
-    for (let i = 0; i < n; i++) ws.push(worker(i === 0));
-    await Promise.all(ws);
-  }
-
-  // 翻页等待期间穿插JD补全，充分利用时间窗
-  async function delayWithEnrich() {
-    const budget = CONFIG.pageDelay[0] + Math.random() * (CONFIG.pageDelay[1] - CONFIG.pageDelay[0]);
-    const t0 = Date.now();
-    await runEnrichPool(budget, t0);
-    const left = budget - (Date.now() - t0);
-    if (left > 0) await sleep(left);
-  }
-
-  async function enrichAll(concurrency) {
-    if (enriching) return;
-    enriching = true;
-    enrichAborted = false;
-    if (concurrency) jdConcurrency = Math.max(1, Math.min(6, concurrency | 0));
-    try {
-      await runEnrichPool(0);
-      if (!enrichAborted) report('DONE', 'JD详情全部获取完成 ✔ 可点击"导出CSV"');
-    } catch (e) {
-      report('WARN', 'JD获取中断：' + (e && e.message));
-    }
-    enriching = false;
-  }
-
   /* ================= 主流程 ================= */
   let running = false;
 
@@ -863,7 +702,7 @@
           break;
         }
         pageNo++;
-        await delayWithEnrich(); // 翻页等待期间穿插JD补全
+        await sleep(CONFIG.pageDelay[0] + Math.random() * (CONFIG.pageDelay[1] - CONFIG.pageDelay[0])); // 模拟人工翻页节奏
       }
     } catch (e) {
       report('ERROR', '运行出错：' + (e && e.message));
@@ -875,15 +714,10 @@
   /* ================= 消息入口 ================= */
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'START') {
-      enrichAborted = false;
       begin();
       sendResponse({ ok: true });
     } else if (msg.type === 'STOP') {
       running = false;
-      enrichAborted = true; // 同步中断JD补全
-      sendResponse({ ok: true });
-    } else if (msg.type === 'START_ENRICH') {
-      enrichAll(msg.concurrency);
       sendResponse({ ok: true });
     } else if (msg.type === 'PING') {
       sendResponse({ ok: true, cards: findCards().length });

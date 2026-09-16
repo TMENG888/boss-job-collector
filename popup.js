@@ -69,7 +69,7 @@ function buildUrl(keyword, city) {
 $('startBtn').addEventListener('click', async () => {
   const target = Math.max(1, Math.min(1000, parseInt($('target').value, 10) || 100));
   const enrich = $('enrichCheck').checked;
-  const concurrency = Math.max(1, Math.min(6, parseInt($('concurrency').value, 10) || 1));
+  const concurrency = 1; // 已改为串行采集（一次一条最稳），保留字段兼容旧存储
   // 并发数两种模式都即时保存
   const d0 = await chrome.storage.local.get(SETTINGS_KEY);
   await chrome.storage.local.set({ [SETTINGS_KEY]: Object.assign({}, d0[SETTINGS_KEY], { concurrency }) });
@@ -102,8 +102,7 @@ $('startBtn').addEventListener('click', async () => {
 $('stopBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'STOP' }));
 $('exportBtn').addEventListener('click', exportCSV);
 $('jdBtn').addEventListener('click', () => chrome.runtime.sendMessage({
-  type: 'START_ENRICH_CMD',
-  concurrency: Math.max(1, Math.min(6, parseInt($('concurrency').value, 10) || 1))
+  type: 'START_ENRICH_CMD'
 }));
 $('sanitizeBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'SANITIZE' }));
 $('clearBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'CLEAR' }));
@@ -114,7 +113,7 @@ $('clearBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type:
   $('keyword').value = s.keyword || 'RPA';
   $('city').value = s.city || '101280100';
   $('target').value = s.target || 100;
-  $('concurrency').value = s.concurrency || 1;
+  // 并发选择器已移除（串行采集）
   refresh();
   setInterval(refresh, 800);
 })();

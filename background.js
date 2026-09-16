@@ -153,19 +153,20 @@ function tellTabStop() {
 async function manualStop(reason) {
   state.running = false;
   state.enrichScheduled = false;
+  enrichStop = true; // 同步中断后台 JD 采集循环
   await saveState();
   setStatus('STOPPED', reason);
   tellTabStop(); // 手动停止 = 全部停止；缺 JD 可之后点"补全JD"
 }
 
-// 调度 JD 补全（带去重，避免多处触发重复调度）
+// 调度 JD 补全（带去重，避免多处触发重复调度）；由后台直接驱动，不依赖内容脚本
 function scheduleEnrich() {
   if (state.enrichScheduled) return;
   if (!state.enrich || pendingCount() === 0) return;
   state.enrichScheduled = true;
   saveState();
-  setStatus('ENRICH', '开始补全JD详情…');
-  notifyTab(activeTabId, 'START_ENRICH', 1500, 40);
+  setStatus('ENRICH', '开始补全JD详情（模拟真人点击进出详情页）…');
+  enrichLoop();
 }
 
 function openSearchPage(url) {
@@ -178,10 +179,6 @@ function openSearchPage(url) {
   });
 }
 
-// —— 真实标签页导航提取（tab 兜底通道）——
-// fetch/iframe 是程序化上下文，BOSS 可能对其返回空壳；真实导航与用户点击行为一致。
-// 串行化：同时只开一个详情标签页（真实导航较重，且降低风控关注）
-let detailTabChain = Promise.resolve();
 
 function waitTabComplete(tabId, timeoutMs) {
   return new Promise((resolve) => {
@@ -231,41 +228,162 @@ function waitTabUrl(tabId, test, timeoutMs) {
   });
 }
 
-function tabExtractDetail(link) {
-  const run = async () => {
-    let tab = null;
-    try {
-      tab = await chrome.tabs.create({ url: link, active: false });
-      // 安检链：security.html(JS算令牌)→重定向回 job_detail。等 URL 落位（最多25s）
-      const landed = await waitTabUrl(tab.id, (u) => /job_detail\//.test(u || ''), 25000);
-      if (landed) await waitTabComplete(tab.id, 15000);
-      // 页面内脚本等水合（最多8s）后提取；内容脚本未就绪则重试下发
-      // 整体预算 ~55s，小于 content 侧 TAB_DETAIL 的 90s 硬超时
-      let resp = null;
-      for (let i = 0; i < 2; i++) {
-        try {
-          resp = await chrome.tabs.sendMessage(tab.id, { type: 'EXTRACT_DETAIL' });
-          if (resp && resp.detail && resp.detail.jd) break;
-        } catch (e) { /* 尚未就绪，稍后重试 */ }
-        await new Promise((r) => setTimeout(r, 1500));
-      }
-      return (
-        (resp && resp.detail) || { jd: '', salary: '', welfare: '', area: '', companyRaw: '', via: 'tab' }
-      );
-    } catch (e) {
-      return {
-        jd: '', salary: '', welfare: '', area: '', companyRaw: '', via: 'tab',
-        diag: { src: 'tab', title: '打开详情页失败', url: link, n: 0, text: String((e && e.message) || e).slice(0, 120) }
-      };
-    } finally {
-      if (tab && tab.id) {
-        try { await chrome.tabs.remove(tab.id); } catch (e) { /* ignore */ }
+// —— JD 详情采集：后台驱动“热”标签页导航（最终架构）——
+// 实测：BOSS 对每次程序化请求（fetch/iframe/新开冷标签页）都返回 JS 安检页；
+// 只有用户已登录、有交互历史的“热”标签页做导航时，被动安检才会像手动点击一样自动通过。
+// 因此详情采集复用搜索页标签页本身：导航进详情 → 提取 → 导航回列表，循环逐条进行。
+
+let enrichLoopRunning = false;
+let enrichStop = false;
+let blockedStreak = 0;
+let pausedUntil = 0; // 熔断：连续被风控拦截时暂停到该时间点
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function tabTitle(tabId) {
+  try {
+    const t = await chrome.tabs.get(tabId);
+    return t.title || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+// 导航热标签页到详情页并提取（完成后负责导航回列表页恢复现场）
+async function warmTabDetail(link) {
+  const tabId = activeTabId;
+  if (tabId == null) return { jd: '', via: 'no-tab' };
+  let listUrl = state.searchUrl;
+  try {
+    const t = await chrome.tabs.get(tabId);
+    if (!listUrl && t.url && /web\/geek\/jobs|job_list/.test(t.url)) listUrl = t.url;
+  } catch (e) { /* ignore */ }
+  const t0 = Date.now();
+  try {
+    await chrome.tabs.update(tabId, { url: link });
+    // 安检链：security.html(JS算令牌)→重定向回 job_detail。等 URL 落位（最多25s）
+    let landed = await waitTabUrl(tabId, (u) => /job_detail\//.test(u || ''), 25000);
+    if (!landed) {
+      // 未落位：大概率是滑块/验证页，请人工完成（完成后 callbackUrl 会自动跳回详情页）
+      const title = await tabTitle(tabId);
+      if (/安全验证|验证码|请稍候|security/i.test(title)) {
+        setStatus('WARN', '页面出现安全验证，请在当前标签页手动完成（滑块/点选），完成后自动继续…');
+        landed = await waitTabUrl(tabId, (u) => /job_detail\//.test(u || ''), 120000);
       }
     }
-  };
-  const p = detailTabChain.then(run, run);
-  detailTabChain = p.catch(() => {});
-  return p;
+    if (!landed) {
+      return {
+        jd: '', via: 'blocked',
+        diag: { src: 'tab', title: await tabTitle(tabId), url: link, n: 0, text: '安检未通过（未落到详情页）' }
+      };
+    }
+    await waitTabComplete(tabId, 15000);
+    // 页面内脚本等水合（最多8s）后提取；内容脚本未就绪则重试下发
+    let resp = null;
+    for (let i = 0; i < 3; i++) {
+      try {
+        resp = await chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_DETAIL' });
+        if (resp && resp.detail && resp.detail.jd) break;
+      } catch (e) { /* 尚未就绪，稍后重试 */ }
+      await sleep(1500);
+    }
+    const d = (resp && resp.detail) || { jd: '', via: 'tab' };
+    d.ms = Date.now() - t0;
+    return d;
+  } catch (e) {
+    return {
+      jd: '', via: 'fail', ms: Date.now() - t0,
+      diag: { src: 'tab', title: '导航失败', url: link, n: 0, text: String((e && e.message) || e).slice(0, 120) }
+    };
+  } finally {
+    // 无论成败都导航回列表页恢复现场（用户能继续看到列表）
+    if (listUrl) {
+      try { await chrome.tabs.update(tabId, { url: listUrl }); } catch (e) { /* ignore */ }
+      await waitTabComplete(tabId, 15000);
+    }
+  }
+}
+
+// 详情字段合并（enrichLoop 与 JD_RESULT 消息共用）
+function applyDetail(key, d) {
+  const j = state.collected.find((x) => jobKey(x) === key);
+  if (!j) return null;
+  d = d || {};
+  j.jd = d.jd || '';
+  j.welfare = d.welfare || j.welfare || '';
+  j.salary = pickSalary(j.salary, d.salary); // 详情页薪资优先（已解密）；解密不全则保留列表薪资
+  const comp = parseCompanyRaw(d.companyRaw, j.company);
+  if (!j.company && comp.name) j.company = comp.name;
+  j.industry = j.industry || comp.industry || '';
+  j.scale = j.scale || comp.scale || '';
+  j.funding = j.funding || comp.funding || '';
+  j.area = j.area || d.area || '';
+  sanitizeJob(j);
+  j.detailVia = d.via || '';
+  if (!d.jd && d.diag) j.detailDiag = d.diag; // 诊断：拿不到 JD 时记录页面指纹
+  j.detailTries = (j.detailTries || 0) + 1;
+  // 只有真抓到 JD 才算完成（空结果重试，最多 3 次）；必清 detailFetching 防死循环
+  if (d.jd || j.detailTries >= 3) j.detailFetched = true;
+  j.detailFetching = false;
+  return j;
+}
+
+// 串行采集循环：领取 → 热标签页导航提取 → 回写 → 节流 → 下一条
+async function enrichLoop() {
+  if (enrichLoopRunning) return;
+  enrichLoopRunning = true;
+  enrichStop = false;
+  try {
+    for (;;) {
+      if (enrichStop) break;
+      if (Date.now() < pausedUntil) { await sleep(3000); continue; }
+      const now = Date.now();
+      const retryable = (j) => j.detailFetching && now - (j.fetchStartedAt || 0) > 90000;
+      const j = state.collected.find((x) => (!x.detailFetched && !x.detailFetching) || retryable(x));
+      if (!j) break; // 全部处理完
+      const key = jobKey(j);
+      j.detailFetching = true;
+      j.fetchStartedAt = Date.now();
+      await saveState();
+      setStatus('ENRICH', `JD详情 ${state.collected.indexOf(j) + 1}/${state.collected.length}：${j.name}`);
+      const d = await warmTabDetail(j.link);
+      applyDetail(key, d);
+      if (enrichStop) break;
+      const done = state.collected.length - pendingCount();
+      const tag = d.jd
+        ? ` · 上条 ${(d.ms / 1000).toFixed(1)}s`
+        : d.via === 'blocked'
+          ? ' · ⚠安全验证未通过'
+          : d.diag
+            ? ` · 页面:"${d.diag.title || '无标题'}"(${d.diag.n || '?'}字)`
+            : ' · 未取到JD，稍后重试';
+      setStatus('ENRICH', `JD获取中：已完成 ${done}/${state.collected.length}（还剩 ${pendingCount()}）${tag}`);
+      if (d.via === 'blocked') {
+        blockedStreak++;
+        if (blockedStreak >= 3 && Date.now() > pausedUntil) {
+          pausedUntil = Date.now() + 90000;
+          setStatus('WARN', '连续遇到安全验证，暂停90秒后自动重试；若页面有滑块请手动完成');
+        }
+      } else if (d.jd) {
+        blockedStreak = 0;
+        pausedUntil = 0;
+      }
+      await sleep(1200 + Math.random() * 1500); // 模拟真人翻看节奏
+    }
+    state.enrichScheduled = false;
+    await saveState();
+    if (enrichStop) {
+      setStatus('STOPPED', '已停止（可点"补全JD"继续补齐详情）');
+    } else {
+      const left = pendingCount();
+      if (left > 0) {
+        setStatus('WARN', `JD补全结束：还剩 ${left} 条未取到（多为反复拿不到的岗位），可稍后再点"补全JD"重试`);
+      } else if (state.collected.length) {
+        setStatus('DONE', `全部完成 ✔ 共 ${state.collected.length} 条（含JD详情），可点击"导出CSV"`);
+      }
+    }
+  } finally {
+    enrichLoopRunning = false;
+  }
 }
 
 // 带重试的消息下发（content script 可能尚未就绪）
@@ -301,6 +419,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg && msg.type) {
       case 'START': {
+        enrichStop = true; // 若旧采集循环在跑，立即停下（新循环启动时会重置）
         state.target = msg.target || 100;
         state.enrich = msg.enrich !== false;
         state.collected = [];
@@ -394,74 +513,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       /* ---------- JD 详情补全 ---------- */
-      case 'GET_CONCURRENCY': {
-        sendResponse({ concurrency: state.concurrency || 1 });
-        break;
-      }
-      case 'TAB_DETAIL': {
-        // 真实标签页导航提取：详情请求拿不到内容时的终极兑底
-        const detail = await tabExtractDetail(String(msg.link || ''));
-        sendResponse({ detail });
-        break;
-      }
-      case 'GET_NEXT_PENDING': {
-        const now = Date.now();
-        // 超过 60s 未返回的任务视为失败，可重试
-        const retryable = (j) => j.detailFetching && now - (j.fetchStartedAt || 0) > 60000;
-        const pending = state.collected.filter((x) => !x.detailFetched || retryable(x));
-        if (!pending.length || !state.enrich) {
-          sendResponse({ job: null, pending: 0, total: state.collected.length });
-          break;
-        }
-        const j = pending[0];
-        j.detailFetching = true;
-        j.fetchStartedAt = now;
-        await saveState();
-        sendResponse({
-          job: { key: jobKey(j), link: j.link, name: j.name, no: state.collected.indexOf(j) + 1 },
-          pending: pending.length,
-          total: state.collected.length
-        });
-        break;
-      }
-
       case 'JD_RESULT': {
-        const j = state.collected.find((x) => jobKey(x) === msg.key);
-        if (j) {
-          const d = msg.detail || {};
-          j.jd = d.jd || '';
-          j.welfare = d.welfare || j.welfare || '';
-          j.salary = pickSalary(j.salary, d.salary); // 详情页薪资直接并入"薪资"字段
-          const comp = parseCompanyRaw(d.companyRaw, j.company);
-          if (!j.company && comp.name) j.company = comp.name;
-          j.industry = j.industry || comp.industry || '';
-          j.scale = j.scale || comp.scale || '';
-          j.funding = j.funding || comp.funding || '';
-          j.area = j.area || d.area || '';
-          sanitizeJob(j); // 终校验修复
-          j.detailVia = d.via || '';
-          // 诊断：拿不到 JD 时记录实际返回的页面指纹（登录墙/空壳/重定向一眼可见）
-          if (!d.jd && d.diag) j.detailDiag = d.diag;
-          // 只有真抓到 JD 才算完成（空结果重试，最多 3 次）；无论成败都清 detailFetching，
-          // 否则 60s 后 retryable() 会把任务误判为超时可重试，worker 死循环重抓最早一批
-          j.detailTries = (j.detailTries || 0) + 1;
-          if (d.jd || j.detailTries >= 3) j.detailFetched = true;
-          j.detailFetching = false;
-          const left = pendingCount();
-          if (left > 0) {
-            const dg = d.diag;
-            const tag = dg
-              ? ` · 页面:"${dg.title || '无标题'}"(${dg.n || '?'}字)`
-              : d.via === 'blocked'
-                ? ' · ⚠风控拦截'
-                : d.ms ? ` · 上条 ${d.ms}ms` : '';
-            setStatus('ENRICH', `JD获取中：还剩 ${left} 条（已完成 ${state.collected.length - left}/${state.collected.length}）${tag}`);
-          } else {
-            state.enrichScheduled = false;
-            setStatus('DONE', `全部完成 ✔ 共 ${state.collected.length} 条（含JD详情），可点击"导出CSV"`);
-          }
-          await saveState();
-        }
+        // 兼容保留（当前详情采集由 enrichLoop 驱动，不再走内容脚本上报）
+        applyDetail(msg.key, msg.detail);
+        await saveState();
         sendResponse({ ok: true });
         break;
       }
@@ -483,8 +538,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           tabId = tab.id;
           activeTabId = tab.id;
         }
-        setStatus('ENRICH', '开始补全JD详情…');
-        notifyTab(tabId, 'START_ENRICH');
+        setStatus('ENRICH', '开始补全JD详情（模拟真人点击进出详情页）…');
+        scheduleEnrich();
         sendResponse({ ok: true });
         break;
       }
