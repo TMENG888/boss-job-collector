@@ -552,71 +552,84 @@
     let jd = '';
     let jdVia = ''; // 命中层级（诊断用）
     const valid = (t) => t && t.length >= 50;
-    try {
+    // 每层独立隔离：单层异常只跳过该层，绝不殃及其余层
+    // （真实DOM测试暴露：四层共用一个try时，单层抛异常会让JD全空）
+    const layer = (name, fn) => {
+      if (valid(jd)) return;
+      try {
+        fn();
+        if (valid(jd)) jdVia = name;
+      } catch (e) { /* 忽略单层异常 */ }
+    };
+
+    layer('层1容器拼接', () => {
       // 层1：圈定 JD 模块容器 → 全部分块按文档序去重拼接（职责/任职要求分块不漏）
       const scope =
         root.querySelector('[class*="job-desc"]') ||
         root.querySelector('.job-detail-section') ||
         root.querySelector('.detail-content');
-      if (scope) {
-        const blocks = [];
-        for (const s of SEL_DETAIL.jd) {
-          qsa(s, scope).forEach((el) => {
-            const t = (el.textContent || '').trim();
-            if (t.length > 15) blocks.push(el);
-          });
-        }
-        const leaves = blocks.filter((el) => !blocks.some((o) => o !== el && el.contains(o)));
-        leaves.sort((a, b) =>
-          a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
-        );
-        const parts = [];
-        for (const el of leaves) {
-          const t = blockText(el);
-          if (t && !parts.includes(t)) parts.push(t);
-        }
-        jd = parts.join('\n');
-        if (!valid(jd)) jd = blockText(scope);
-        if (valid(jd)) jdVia = '层1容器拼接';
+      if (!scope) return;
+      const blocks = [];
+      for (const s of SEL_DETAIL.jd) {
+        qsa([s], scope).forEach((el) => {
+          const t = (el.textContent || '').trim();
+          if (t.length > 15) blocks.push(el);
+        });
       }
+      const leaves = blocks.filter((el) => !blocks.some((o) => o !== el && el.contains(o)));
+      leaves.sort((a, b) =>
+        a.compareDocumentPosition(b) & Node.DOCUMENT_POSITION_FOLLOWING ? -1 : 1
+      );
+      const parts = [];
+      for (const el of leaves) {
+        const t = blockText(el);
+        if (t && !parts.includes(t)) parts.push(t);
+      }
+      jd = parts.join('\n');
+      if (!valid(jd)) jd = blockText(scope);
+    });
+
+    layer('层2选择器', () => {
       // 层2：老式直接命中（容器类名改版时仍可能命中分块本身）
-      if (!valid(jd)) {
-        const el = pick(SEL_DETAIL.jd);
-        if (el) { jd = blockText(el); jdVia = '层2选择器'; }
-      }
+      const el = pick(SEL_DETAIL.jd);
+      if (el) jd = blockText(el);
+    });
+
+    layer('层3关键词', () => {
       // 层3：关键词定位（不限 class，找包含职责/要求等关键词的最紧凑文本块）
-      if (!valid(jd)) {
-        const cands = [];
-        for (const e of root.querySelectorAll('div,section')) {
-          const t = e.textContent || '';
-          if (t.length < 60 || t.length > 6000) continue;
-          const hits = (t.match(/岗位职责|工作职责|职位描述|任职要求|工作内容|任职资格|岗位要求|职责|工作要求/g) || []).length;
-          if (hits) cands.push({ e, t, hits });
-        }
-        cands.sort((a, b) => (b.hits - a.hits) || (a.t.length - b.t.length));
-        if (cands.length) { jd = blockText(cands[0].e); jdVia = '层3关键词'; }
+      const cands = [];
+      for (const e of root.querySelectorAll('div,section')) {
+        const t = e.textContent || '';
+        if (t.length < 60 || t.length > 6000) continue;
+        const hits = (t.match(/岗位职责|工作职责|职位描述|任职要求|工作内容|任职资格|岗位要求|职责|工作要求/g) || []).length;
+        if (hits) cands.push({ e, t, hits });
       }
+      cands.sort((a, b) => (b.hits - a.hits) || (a.t.length - b.t.length));
+      if (cands.length) jd = blockText(cands[0].e);
+    });
+
+    layer('层4兜底', () => {
       // 层4：最后兜底——取最大的 200~4500 字文本块（JD 通常是页面主内容区），
       // 但必须含岗位词汇，防止把导航/页脚等噪声当 JD
-      if (!valid(jd)) {
-        let best = null;
-        let bestLen = 0;
-        for (const e of root.querySelectorAll('div,section')) {
-          const t = (e.textContent || '').trim();
-          if (t.length < 200 || t.length > 4500 || t.length <= bestLen) continue;
-          if (/职责|任职|负责|熟悉|优先|经验|岗位/.test(t)) { best = e; bestLen = t.length; }
-        }
-        if (best) { jd = blockText(best); jdVia = '层4兑底'; }
+      let best = null;
+      let bestLen = 0;
+      for (const e of root.querySelectorAll('div,section')) {
+        const t = (e.textContent || '').trim();
+        if (t.length < 200 || t.length > 4500 || t.length <= bestLen) continue;
+        if (/职责|任职|负责|熟悉|优先|经验|岗位/.test(t)) { best = e; bestLen = t.length; }
       }
-    } catch (e) { /* 提取层任何异常都不应中断整条任务 */ }
+      if (best) jd = blockText(best);
+    });
+
     const salaryEl = pick(SEL_DETAIL.salary);
     const areaEl = pick(SEL_DETAIL.area);
-    const welfare = qsa(SEL_DETAIL.welfare, root).map(txt).filter(Boolean).join('、');
+    const welfare = [...new Set(qsa(SEL_DETAIL.welfare, root).map(txt).filter(Boolean))].join('、');
     const compEl = pick(SEL_DETAIL.companyBlock);
     // 公司信息块保留换行，供后台按 token 解析公司名/行业/规模/融资
     const raw = compEl ? String(compEl.innerText || compEl.textContent || '') : '';
     return {
       jd: String(jd || '').slice(0, 5000),
+      jdVia,
       salary: salaryEl ? txt(salaryEl) : '',
       welfare,
       area: areaEl ? txt(areaEl) : '',

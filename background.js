@@ -286,6 +286,15 @@ async function warmTabDetail(link) {
         break;
       } catch (e) { await sleep(1000); }
     }
+    if (!injected) {
+      // 自动注入失败（扩展重载后的孤儿页/注入时序问题）：用 scripting API 手动注入再试
+      try {
+        await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
+        await sleep(800);
+        await chrome.tabs.sendMessage(tabId, { type: 'PING' });
+        injected = true;
+      } catch (e) { /* 注入也失败，走“未注入”诊断分支 */ }
+    }
     let resp = null;
     if (injected) {
       // 页面内脚本等水合（最多8s）后提取；未取到则重试下发
