@@ -18,3 +18,4 @@ build/
 *.zip
 *.crx
 *.pem
+_test_links.txt
