@@ -494,7 +494,22 @@ const ALARM_ENRICH = 'enrichTick';
 const ALARM_HEARTBEAT = 'enrichHeartbeat';
 // 每日JD额度：账号有违规记录后，控制日均详情量是最有效的自保手段
 // （解封当天千万别急着跑满1000，建议每天300条内分多次补全）
-const DAILY_JD_CAP = 300;
+// 每日JD额度：默认 300 条/天，可在弹窗"每日JD上限"调整（0=不限制）。
+// 注意：300 并非实测阈值，而是保守推断值——真实日志显示单日~1000条本身
+// 未立刻封禁，但账号风险分疑似跨天累积（"多次违规"），额度用于控制累积速度
+let dailyCap = 300;
+try {
+  chrome.storage.onChanged.addListener((changes, area) => {
+    if (area === 'local' && changes.boss_settings) {
+      const v = changes.boss_settings.newValue && changes.boss_settings.newValue.dailyCap;
+      dailyCap = v == null ? 300 : Math.max(0, parseInt(v, 10) || 0);
+    }
+  });
+  chrome.storage.local.get('boss_settings').then((d) => {
+    const v = d && d.boss_settings && d.boss_settings.dailyCap;
+    if (v != null) dailyCap = Math.max(0, parseInt(v, 10) || 0);
+  }).catch(() => {});
+} catch (e) { /* ignore */ }
 let tickBusy = false;
 
 function scheduleNextTick(delayMs) {
@@ -516,12 +531,12 @@ async function enrichTick() {
       state.dailyDate = today;
       state.dailyCount = 0;
     }
-    if ((state.dailyCount || 0) >= DAILY_JD_CAP) {
+    if (dailyCap > 0 && (state.dailyCount || 0) >= dailyCap) {
       const next = new Date();
       next.setHours(8, 0, 0, 0);
       if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
-      setStatus('WARN', `已达今日JD安全额度（${DAILY_JD_CAP} 条），明早8点后自动继续（账号有违规记录，日均量需克制）`);
-      pushLog('WARN', `今日JD额度已用完（${state.dailyCount}/${DAILY_JD_CAP}），休眠至次日08:00自动继续`);
+      setStatus('WARN', `已达今日JD额度（${dailyCap} 条），明早8点后自动继续（可在弹窗"每日JD上限"调整，0=不限）`);
+      pushLog('WARN', `今日JD额度已用完（${state.dailyCount}/${dailyCap}），休眠至次日08:00自动继续`);
       await saveState();
       scheduleNextTick(next.getTime() - Date.now() + 60000);
       return;

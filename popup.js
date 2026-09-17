@@ -109,11 +109,12 @@ $('startBtn').addEventListener('click', async () => {
     const raw = $('keyword').value.trim() || 'RPA';
     const cityInput = $('city').value.trim();
     const city = resolveCity(cityInput);
+    const dailyCap = Math.max(0, parseInt($('dailyCap').value, 10) || 0);
     // 多关键词用逗号分隔（中英文逗号、顿号均可）时逐个接力；
     // 每个关键词严格忠于自身检索结果，不做变体扩展
     const keywords = raw.split(/[,，、]+/).map((x) => x.trim()).filter(Boolean);
     if (!keywords.length) keywords.push('RPA');
-    await chrome.storage.local.set({ [SETTINGS_KEY]: { keyword: raw, city, cityName: cityInput, target } });
+    await chrome.storage.local.set({ [SETTINGS_KEY]: { keyword: raw, city, cityName: cityInput, target, dailyCap } });
     const seen = new Set();
     urls = [];
     for (const kw of keywords) {
@@ -141,6 +142,7 @@ $('logBtn').addEventListener('click', () => chrome.tabs.create({ url: chrome.run
   // 兼容旧数据：存的是代码则反查城市名显示
   $('city').value = s.cityName || CITY_NAME_BY_CODE[s.city] || (s.city === CITY_ALL ? '' : s.city) || '广州';
   $('target').value = s.target || 100;
+  $('dailyCap').value = s.dailyCap != null ? s.dailyCap : 300;
   // 并发选择器已移除（串行采集）
   refresh();
   setInterval(refresh, 800);
