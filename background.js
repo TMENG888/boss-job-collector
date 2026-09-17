@@ -77,7 +77,9 @@ function setStatus(s, m) {
     setStatus('RUN', '检测到任务曾被中断，已自动恢复采集…');
     notifyTab(activeTabId, 'START', 1200, 30);
   } else if (state.enrichScheduled && state.collected.length) {
-    scheduleEnrich(); // JD补全中断，重新调度
+    // JD补全曾中断（enrichScheduled 已置位）：直接安排下一闹钟，勿走 scheduleEnrich（会因已置位被拒）
+    enrichStop = false;
+    scheduleNextTick(5000);
   }
 })();
 
@@ -198,20 +200,22 @@ function tellTabStop() {
 async function manualStop(reason) {
   state.running = false;
   state.enrichScheduled = false;
-  enrichStop = true; // 同步中断后台 JD 采集循环
+  enrichStop = true; // 同步中断闹钟驱动的 JD 采集
+  try { await chrome.alarms.clear(ALARM_ENRICH); } catch (e) { /* ignore */ }
   await saveState();
   setStatus('STOPPED', reason);
   tellTabStop(); // 手动停止 = 全部停止；缺 JD 可之后点"补全JD"
 }
 
-// 调度 JD 补全（带去重，避免多处触发重复调度）；由后台直接驱动，不依赖内容脚本
+// 调度 JD 补全（带去重，避免多处触发重复调度）；闹钟驱动，不依赖内容脚本与前台
 function scheduleEnrich() {
   if (state.enrichScheduled) return;
   if (!state.enrich || pendingCount() === 0) return;
   state.enrichScheduled = true;
+  enrichStop = false;
   saveState();
-  setStatus('ENRICH', '开始补全JD详情（模拟真人点击进出详情页）…');
-  enrichLoop();
+  setStatus('ENRICH', '开始补全JD详情（模拟真人点击进出详情页，可后台运行）…');
+  scheduleNextTick(3000);
 }
 
 function openSearchPage(url) {
@@ -278,7 +282,6 @@ function waitTabUrl(tabId, test, timeoutMs) {
 // 只有用户已登录、有交互历史的“热”标签页做导航时，被动安检才会像手动点击一样自动通过。
 // 因此详情采集复用搜索页标签页本身：导航进详情 → 提取 → 导航回列表，循环逐条进行。
 
-let enrichLoopRunning = false;
 let enrichStop = false;
 let blockedStreak = 0;
 let pausedUntil = 0; // 熔断：连续被风控拦截时暂停到该时间点
@@ -289,18 +292,16 @@ let nextBreakAt = 5 + Math.floor(Math.random() * 5); // 每5~9条随机长休一
 let cleanJobs = 0;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// 条间拟人间歇：基础4~9s × 减速因子；周期性插入30~90s长休（真人不会匀速刷几百条）
-async function pace() {
+// 拟人节奏：条间4~9s×减速因子；每5~9条插入30~90s长休（真人不会匀速刷几百条）。
+// 以“下一次闹钟的延迟”表达——SW 可在等待中休眠，闹钟到点会唤醒它继续
+function nextDelayMs() {
   jobsSinceBreak++;
   if (jobsSinceBreak >= nextBreakAt) {
-    const brk = 30000 + Math.random() * 60000;
-    setStatus('ENRICH', `已连续采集 ${jobsSinceBreak} 条，模拟真人休息 ${Math.round(brk / 1000)}s 后继续…`);
     jobsSinceBreak = 0;
     nextBreakAt = 5 + Math.floor(Math.random() * 5);
-    await sleep(brk);
-    return;
+    return 30000 + Math.random() * 60000;
   }
-  await sleep((4000 + Math.random() * 5000) * slowFactor);
+  return (4000 + Math.random() * 5000) * slowFactor;
 }
 
 async function tabTitle(tabId) {
@@ -317,10 +318,19 @@ async function warmTabDetail(link) {
   const tabId = activeTabId;
   if (tabId == null) return { jd: '', via: 'no-tab' };
   let listUrl = state.searchUrl;
+  let winId = null;
   try {
     const t = await chrome.tabs.get(tabId);
+    winId = t.windowId;
     if (!listUrl && t.url && /web\/geek\/jobs|job_list/.test(t.url)) listUrl = t.url;
   } catch (e) { /* ignore */ }
+  // 窗口被最小化时后台标签页会被强节流甚至冻结：无焦点恢复（不抢前台，用户无感）
+  if (winId != null) {
+    try {
+      const win = await chrome.windows.get(winId);
+      if (win.state === 'minimized') await chrome.windows.update(winId, { state: 'normal', focused: false });
+    } catch (e) { /* ignore */ }
+  }
   const t0 = Date.now();
   try {
     await chrome.tabs.update(tabId, { url: link });
@@ -395,7 +405,7 @@ async function warmTabDetail(link) {
   }
 }
 
-// 详情字段合并（enrichLoop 与 JD_RESULT 消息共用）
+// 详情字段合并（enrichTick 闹钟步与 JD_RESULT 消息共用）
 function applyDetail(key, d) {
   const j = state.collected.find((x) => jobKey(x) === key);
   if (!j) return null;
@@ -419,72 +429,87 @@ function applyDetail(key, d) {
   return j;
 }
 
-// 串行采集循环：领取 → 热标签页导航提取 → 回写 → 节流 → 下一条
-async function enrichLoop() {
-  if (enrichLoopRunning) return;
-  enrichLoopRunning = true;
-  enrichStop = false;
+// 闹钟驱动的单步状态机：每步处理一条JD，随后安排下一次闹钟。
+// SW 在步与步之间可以被浏览器休眠——闹钟到点会把它唤醒继续，
+// 因此浏览器放后台/窗口最小化都不会中断任务（请求节奏不变，风控无感）
+const ALARM_ENRICH = 'enrichTick';
+let tickBusy = false;
+
+function scheduleNextTick(delayMs) {
+  if (enrichStop) return;
+  chrome.alarms.create(ALARM_ENRICH, { when: Date.now() + Math.max(1000, delayMs) });
+}
+
+async function enrichTick() {
+  if (tickBusy || enrichStop || !state.enrichScheduled) return;
+  tickBusy = true;
   try {
-    for (;;) {
-      if (enrichStop) break;
-      if (Date.now() < pausedUntil) { await sleep(3000); continue; }
-      const now = Date.now();
-      const retryable = (j) => j.detailFetching && now - (j.fetchStartedAt || 0) > 90000;
-      const j = state.collected.find((x) => (!x.detailFetched && !x.detailFetching) || retryable(x));
-      if (!j) break; // 全部处理完
-      const key = jobKey(j);
-      j.detailFetching = true;
-      j.fetchStartedAt = Date.now();
-      await saveState();
-      setStatus('ENRICH', `JD详情 ${state.collected.indexOf(j) + 1}/${state.collected.length}：${j.name}`);
-      const d = await warmTabDetail(j.link);
-      applyDetail(key, d);
-      if (enrichStop) break;
-      const done = state.collected.length - pendingCount();
-      const tag = d.jd
-        ? ` · 上条 ${(d.ms / 1000).toFixed(1)}s · ${d.jdVia || ''}`
-        : d.via === 'blocked'
-          ? ' · ⚠安全验证未通过'
-          : d.diag
-            ? ` · ${d.diag.title || '无标题'}(${d.diag.n || '?'}字)${d.diag.text ? ' ' + String(d.diag.text).slice(0, 60) : ''}`
-            : ' · 未取到JD，稍后重试';
-      setStatus('ENRICH', `JD获取中：已完成 ${done}/${state.collected.length}（还剩 ${pendingCount()}）${tag}`);
-      if (d.via === 'blocked') {
-        blockedStreak++;
-        slowFactor = Math.min(4, slowFactor * 1.5); // 被拦截立即整体减速
-        if (blockedStreak === 1) {
-          // 首次拦截就冷却：封禁期间继续请求只会延长封禁
-          setStatus('WARN', '遇到风控拦截，冷却30~60秒后继续（已自动降低整体速度）…');
-          await sleep(30000 + Math.random() * 30000);
-        }
-        if (blockedStreak >= 3 && Date.now() > pausedUntil) {
-          pausedUntil = Date.now() + 90000;
-          setStatus('WARN', '连续遇到安全验证，暂停90秒后自动重试；若页面有滑块请手动完成');
-        }
-      } else if (d.jd) {
-        blockedStreak = 0;
-        cleanJobs++;
-        if (cleanJobs % 15 === 0) slowFactor = Math.max(1, slowFactor * 0.9); // 顺利时缓慢恢复速度
-        pausedUntil = 0;
-      }
-      await pace(); // 拟人节奏：条间间歇 + 周期性长休
+    if (Date.now() < pausedUntil) {
+      scheduleNextTick(pausedUntil - Date.now() + 1000); // 熔断冷却中，等解除
+      return;
     }
-    state.enrichScheduled = false;
-    await saveState();
-    if (enrichStop) {
-      setStatus('STOPPED', '已停止（可点"补全JD"继续补齐详情）');
-    } else {
+    const now = Date.now();
+    const retryable = (j) => j.detailFetching && now - (j.fetchStartedAt || 0) > 90000;
+    const j = state.collected.find((x) => (!x.detailFetched && !x.detailFetching) || retryable(x));
+    if (!j) {
+      // 全部处理完
+      state.enrichScheduled = false;
+      await saveState();
       const left = pendingCount();
       if (left > 0) {
         setStatus('WARN', `JD补全结束：还剩 ${left} 条未取到（多为反复拿不到的岗位），可稍后再点"补全JD"重试`);
       } else if (state.collected.length) {
         setStatus('DONE', `全部完成 ✔ 共 ${state.collected.length} 条（含JD详情），可点击"导出CSV"`);
       }
+      return;
     }
+    const key = jobKey(j);
+    j.detailFetching = true;
+    j.fetchStartedAt = Date.now();
+    await saveState();
+    setStatus('ENRICH', `JD详情 ${state.collected.indexOf(j) + 1}/${state.collected.length}：${j.name}`);
+    const d = await warmTabDetail(j.link);
+    applyDetail(key, d);
+    const done = state.collected.length - pendingCount();
+    const tag = d.jd
+      ? ` · 上条 ${(d.ms / 1000).toFixed(1)}s · ${d.jdVia || ''}`
+      : d.via === 'blocked'
+        ? ' · ⚠风控拦截'
+        : d.diag
+          ? ` · ${d.diag.title || '无标题'}(${d.diag.n || '?'}字)${d.diag.text ? ' ' + String(d.diag.text).slice(0, 60) : ''}`
+          : ' · 未取到JD，稍后重试';
+    setStatus('ENRICH', `JD获取中：已完成 ${done}/${state.collected.length}（还剩 ${pendingCount()}）${tag}`);
+
+    // 计算下一步延迟（含风控应对与拟人节奏），以闹钟形式安排
+    let delay = nextDelayMs();
+    if (d.via === 'blocked') {
+      blockedStreak++;
+      slowFactor = Math.min(4, slowFactor * 1.5); // 被拦截立即整体减速
+      if (blockedStreak === 1) {
+        // 首次拦截就冷却：封禁期间继续请求只会延长封禁
+        delay = 30000 + Math.random() * 30000;
+        setStatus('WARN', '遇到风控拦截，冷却约1分钟后继续（已自动降低整体速度）…');
+      }
+      if (blockedStreak >= 3) {
+        pausedUntil = Date.now() + 90000;
+        setStatus('WARN', '连续遇到安全验证，暂停90秒后自动重试；若页面有滑块请手动完成');
+      }
+    } else if (d.jd) {
+      blockedStreak = 0;
+      cleanJobs++;
+      if (cleanJobs % 15 === 0) slowFactor = Math.max(1, slowFactor * 0.9); // 顺利时缓慢恢复速度
+      pausedUntil = 0;
+    }
+    if (Date.now() < pausedUntil) delay = Math.max(delay, pausedUntil - Date.now());
+    scheduleNextTick(delay);
   } finally {
-    enrichLoopRunning = false;
+    tickBusy = false;
   }
 }
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  if (alarm.name === ALARM_ENRICH) enrichTick();
+});
 
 // 带重试的消息下发（content script 可能尚未就绪）
 function notifyTab(tabId, type, gapMs = 1200, maxTries = 40) {
@@ -519,7 +544,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
   (async () => {
     switch (msg && msg.type) {
       case 'START': {
-        enrichStop = true; // 若旧采集循环在跑，立即停下（新循环启动时会重置）
+        enrichStop = true; // 若旧采集在跑，立即停下（新调度启动时会重置）
+        try { chrome.alarms.clear(ALARM_ENRICH); } catch (e) { /* ignore */ }
         state.target = msg.target || 100;
         state.enrich = msg.enrich !== false;
         state.collected = [];
@@ -616,7 +642,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       /* ---------- JD 详情补全 ---------- */
       case 'JD_RESULT': {
-        // 兼容保留（当前详情采集由 enrichLoop 驱动，不再走内容脚本上报）
+        // 兼容保留（当前详情采集由 enrichTick 闹钟步驱动，不再走内容脚本上报）
         applyDetail(msg.key, msg.detail);
         await saveState();
         sendResponse({ ok: true });
