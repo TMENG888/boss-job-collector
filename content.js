@@ -504,6 +504,15 @@
     );
   }
 
+  // 当前页码（从 URL 提取，跨导航准确）
+  function curPageNo() {
+    try {
+      return parseInt(new URL(location.href).searchParams.get('page'), 10) || 1;
+    } catch (e) {
+      return 1;
+    }
+  }
+
   async function gotoNextPage() {
     const before = firstCardKey();
     const countBefore = findCards().length;
@@ -524,17 +533,24 @@
           return true;
         }
       }
-      return false;
+      report('WARN', `点击下一页无反应（等待 ${Math.round(CONFIG.pageChangeTimeout / 1000)}s 内容未变化），改用直接跳转第 ${curPageNo() + 1} 页…`);
+    } else {
+      report('WARN', `未找到可用的"下一页"按钮（可能被禁用/改版），改用直接跳转第 ${curPageNo() + 1} 页…`);
     }
 
-    // 没有分页按钮：可能是无限滚动流，尝试滚动加载
-    report('RUN', '未找到分页按钮，尝试滚动加载更多…');
-    for (let round = 0; round < 3; round++) {
-      await scrollThroughPage();
-      await sleep(1500);
-      if (findCards().length > countBefore) return true;
+    // 兕底：直接按页码跳 URL。对平台而言与点击下一页是同一种同标签页导航，无额外风险；
+    // sessionStorage 记录跳页前状态，供落地页校验（防 BOSS 把页码重置回第1页导致死循环）
+    try {
+      sessionStorage.setItem('__boss_prev_first', before || '');
+      sessionStorage.setItem('__boss_next_page', String(curPageNo() + 1));
+      const u = new URL(location.href);
+      u.searchParams.set('page', String(curPageNo() + 1));
+      location.href = u.toString();
+      await sleep(3000); // 导航生效则页面卸载，走不到这里
+      return false;
+    } catch (e) {
+      return false;
     }
-    return false;
   }
 
   /* ================= JD 详情获取 ================= */
@@ -701,7 +717,22 @@
   async function begin() {
     if (running) return;
     running = true;
-    let pageNo = 1;
+    let pageNo = curPageNo();
+    // 直接跳页落地校验（见 gotoNextPage 兕底逻辑）：
+    let jumpWanted = 0;
+    let jumpPrevFirst = '';
+    try {
+      jumpWanted = parseInt(sessionStorage.getItem('__boss_next_page') || '', 10) || 0;
+      jumpPrevFirst = sessionStorage.getItem('__boss_prev_first') || '';
+      sessionStorage.removeItem('__boss_next_page');
+      sessionStorage.removeItem('__boss_prev_first');
+      if (jumpWanted && pageNo !== jumpWanted) {
+        // BOSS 把页码重置了（如该词只有一页，跳第2页被弹回第1页）→ 真采尽
+        report('WARN', `跳页未生效（落在第 ${pageNo} 页），判定该搜索词已采尽`);
+        fire({ type: 'EXHAUSTED' });
+        return;
+      }
+    } catch (e) { /* ignore */ }
     try {
       while (running) {
         report('RUN', `第 ${pageNo} 页：等待岗位列表渲染…`);
@@ -720,6 +751,16 @@
         }
 
         report('RUN', `第 ${pageNo} 页：逐屏读取岗位数据（够数即停）…`);
+        // 跳页落地内容校验：内容与跳页前一致（页码被重置/缓存）→ 采尽，防死循环
+        if (jumpWanted && jumpPrevFirst) {
+          const nowFirst = firstCardKey();
+          if (nowFirst && nowFirst === jumpPrevFirst) {
+            report('WARN', '跳页后列表内容与上一页相同，判定该搜索词已采尽');
+            fire({ type: 'EXHAUSTED' });
+            return;
+          }
+          jumpWanted = 0; // 校验只做一次
+        }
         const res = await collectPageIncrementally();
         if (res === 'STOPPED') break; // 达标/手动停止，状态由后台展示
 

@@ -48,6 +48,7 @@ function setStatus(s, m) {
   }
 }
 
+
 (async () => {
   await loadState();
   // 浏览器刚启动（session 标志不存在）：沿用既有语义，不自动恢复任务
@@ -55,9 +56,15 @@ function setStatus(s, m) {
   if (!bootstrapped) await chrome.storage.session.set({ bootstrapped: true });
   // JD 补全链在任何 SW 唤醒时自动续跑（含浏览器重启后；纯本地恢复，安全）
   if (!state.running && state.enrichScheduled && state.collected.length) {
-    enrichStop = false;
-    pushLog('SYS', 'SW唤醒：自动续跑JD补全');
-    scheduleNextTick(8000);
+    // 仅当闹钟真的丢失（如浏览器重启会清空闹钟）才拉起。SW 正常唤醒时闹钟仍在，
+    // 不重建——否则会覆盖拟人节奏的等待时长（长休/冷却被缩短，等于自废风控节奏）
+    chrome.alarms.getAll((all) => {
+      if (!all.some((a) => a.name === ALARM_ENRICH) && !tickBusy) {
+        enrichStop = false;
+        pushLog('SYS', 'SW唤醒：闹钟丢失，自动续跑JD补全');
+        scheduleNextTick(8000);
+      }
+    });
   }
   if (!bootstrapped) return; // 浏览器冷启动：列表采集任务不自动恢复（沿用既有语义）
   // SW 曾被休眠重启（浏览器未重启）：恢复正在进行的列表采集现场
@@ -141,19 +148,16 @@ function snapshot() {
   };
 }
 
-function setStatus(s, m) {
-  status = { status: s, message: m };
-}
-
 function linkKey(link) {
   try {
-    const u = new URL(link);
-    return (
-      u.searchParams.get('jobId') ||
-      u.searchParams.get('securityId') ||
-      (u.pathname.match(/([0-9a-f]{16,})\.html/i) || [])[1] ||
-      u.pathname
-    );
+    const u = new URL(link, 'https://www.zhipin.com');
+    // 优先取路径中的稳定岗位ID。securityId/lid 是每次搜索会话动态生成的，同一岗位
+    // 在不同关键词下不同——此前把它当主键，导致同一岗位被当成多条记录反复采集
+    const m =
+      u.pathname.match(/job_detail\/([0-9a-zA-Z]+)\.html/i) ||
+      u.pathname.match(/([0-9a-f]{16,})\.html/i);
+    if (m) return m[1].toLowerCase();
+    return u.searchParams.get('jobId') || u.searchParams.get('securityId') || u.pathname;
   } catch (e) {
     return link || '';
   }
@@ -442,28 +446,30 @@ async function warmTabDetail(link) {
   }
 }
 
-// 详情字段合并（enrichTick 闹钟步与 JD_RESULT 消息共用）
+// 详情字段合并（enrichTick 闹钟步与 JD_RESULT 消息共用）；同键孪生记录一并标记
 function applyDetail(key, d) {
-  const j = state.collected.find((x) => jobKey(x) === key);
-  if (!j) return null;
+  const list = state.collected.filter((x) => jobKey(x) === key);
+  if (!list.length) return null;
   d = d || {};
-  j.jd = d.jd || '';
-  j.welfare = d.welfare || j.welfare || '';
-  j.salary = pickSalary(j.salary, d.salary); // 详情页薪资优先（已解密）；解密不全则保留列表薪资
-  const comp = parseCompanyRaw(d.companyRaw, j.company);
-  if (!j.company && comp.name) j.company = comp.name;
-  j.industry = j.industry || comp.industry || '';
-  j.scale = j.scale || comp.scale || '';
-  j.funding = j.funding || comp.funding || '';
-  j.area = j.area || d.area || '';
-  sanitizeJob(j);
-  j.detailVia = d.via || '';
-  if (!d.jd && d.diag) j.detailDiag = d.diag; // 诊断：拿不到 JD 时记录页面指纹
-  j.detailTries = (j.detailTries || 0) + 1;
-  // 只有真抓到 JD 才算完成（空结果重试，最多 3 次）；必清 detailFetching 防死循环
-  if (d.jd || j.detailTries >= 3) j.detailFetched = true;
-  j.detailFetching = false;
-  return j;
+  for (const j of list) {
+    j.jd = d.jd || '';
+    j.welfare = d.welfare || j.welfare || '';
+    j.salary = pickSalary(j.salary, d.salary); // 详情页薪资优先（已解密）；解密不全则保留列表薪资
+    const comp = parseCompanyRaw(d.companyRaw, j.company);
+    if (!j.company && comp.name) j.company = comp.name;
+    j.industry = j.industry || comp.industry || '';
+    j.scale = j.scale || comp.scale || '';
+    j.funding = j.funding || comp.funding || '';
+    j.area = j.area || d.area || '';
+    sanitizeJob(j);
+    j.detailVia = d.via || '';
+    if (!d.jd && d.diag) j.detailDiag = d.diag; // 诊断：拿不到 JD 时记录页面指纹
+    j.detailTries = (j.detailTries || 0) + 1;
+    // 只有真抓到 JD 才算完成（空结果重试，最多 3 次）；必清 detailFetching 防死循环
+    if (d.jd || j.detailTries >= 3) j.detailFetched = true;
+    j.detailFetching = false;
+  }
+  return list[0];
 }
 
 // 闹钟驱动的单步状态机：每步处理一条JD，随后安排下一次闹钟。
@@ -488,7 +494,17 @@ async function enrichTick() {
     }
     const now = Date.now();
     const retryable = (j) => j.detailFetching && now - (j.fetchStartedAt || 0) > 90000;
-    const j = state.collected.find((x) => (!x.detailFetched && !x.detailFetching) || retryable(x));
+    const j = state.collected.find((x) => {
+      if (x.detailFetched) return false;
+      if (x.detailFetching && !retryable(x)) return false;
+      // 同键孪生记录已采过：直接镜像完成，不重复抓取
+      const k = jobKey(x);
+      if (state.collected.some((y) => y !== x && jobKey(y) === k && y.detailFetched)) {
+        x.detailFetched = true;
+        return false;
+      }
+      return true;
+    });
     if (!j) {
       // 全部处理完
       state.enrichScheduled = false;
@@ -508,6 +524,7 @@ async function enrichTick() {
     setStatus('ENRICH', `JD详情 ${state.collected.indexOf(j) + 1}/${state.collected.length}：${j.name}`);
     const d = await warmTabDetail(j.link);
     applyDetail(key, d);
+    await saveState(); // 立即持久化：SW 在步间休眠也不丢结果（此前丢失导致同一岗位反复重抓）
     const done = state.collected.length - pendingCount();
     const tag = d.jd
       ? ` · 上条 ${(d.ms / 1000).toFixed(1)}s · ${d.jdVia || ''}`
@@ -735,17 +752,45 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       }
 
       case 'SANITIZE': {
-        // 对已采集数据做全量校验修复（清洗历史脏数据，无需重新采集）
+        // 全量校验修复：合并同键重复记录（同一岗位跨搜索词重复出现）+ 清洗字段 + 回填空值
         if (!state.collected.length) {
           setStatus(status.status === 'DONE' ? 'DONE' : 'IDLE', '暂无数据可校验');
           sendResponse({ ok: true, fixed: 0, ...snapshot() });
           break;
         }
-        let fixed = 0;
-        state.collected.forEach((j) => { if (sanitizeJob(j)) fixed++; });
+        const byKey = new Map();
+        const out = [];
+        let merged = 0;
+        let filled = 0;
+        for (const j of state.collected) {
+          const k = jobKey(j);
+          const prev = byKey.get(k);
+          if (!prev) {
+            sanitizeJob(j);
+            byKey.set(k, j);
+            out.push(j);
+            continue;
+          }
+          merged++;
+          for (const f of ['name', 'salary', 'area', 'experience', 'education', 'skills', 'welfare', 'company', 'industry', 'scale', 'funding', 'jd', 'link']) {
+            if (!prev[f] && j[f]) {
+              prev[f] = j[f];
+              filled++;
+            }
+          }
+          if (j.detailFetched) {
+            prev.detailFetched = true;
+            prev.detailFetching = false;
+            prev.detailVia = prev.detailVia || j.detailVia;
+          }
+          if (j.collectedAt && (!prev.collectedAt || j.collectedAt < prev.collectedAt)) prev.collectedAt = j.collectedAt;
+        }
+        const removed = state.collected.length - out.length;
+        state.collected = out;
         await saveState();
-        setStatus(status.status === 'DONE' ? 'DONE' : 'IDLE', `校验完成：清理/修复 ${fixed} 条记录的异常值`);
-        sendResponse({ ok: true, fixed, ...snapshot() });
+        setStatus(status.status === 'DONE' ? 'DONE' : 'IDLE', `校验完成：合并 ${removed} 条重复、回填 ${filled} 个空字段`);
+        pushLog('ACTION', `校验修复：合并 ${removed} 条同键重复记录，回填 ${filled} 个空字段`);
+        sendResponse({ ok: true, fixed: merged, ...snapshot() });
         break;
       }
 
