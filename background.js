@@ -52,11 +52,14 @@ function setStatus(s, m) {
   await loadState();
   // 浏览器刚启动（session 标志不存在）：沿用既有语义，不自动恢复任务
   const { bootstrapped } = await chrome.storage.session.get('bootstrapped');
-  if (!bootstrapped) {
-    await chrome.storage.session.set({ bootstrapped: true });
-    return;
+  if (!bootstrapped) await chrome.storage.session.set({ bootstrapped: true });
+  // JD 补全链在任何 SW 唤醒时自动续跑（含浏览器重启后；纯本地恢复，安全）
+  if (!state.running && state.enrichScheduled && state.collected.length) {
+    enrichStop = false;
+    scheduleNextTick(8000);
   }
-  // SW 曾被休眠重启（浏览器未重启）：恢复正在进行的任务现场
+  if (!bootstrapped) return; // 浏览器冷启动：列表采集任务不自动恢复（沿用既有语义）
+  // SW 曾被休眠重启（浏览器未重启）：恢复正在进行的列表采集现场
   if (state.running) {
     try {
       await chrome.tabs.get(activeTabId);
@@ -433,6 +436,7 @@ function applyDetail(key, d) {
 // SW 在步与步之间可以被浏览器休眠——闹钟到点会把它唤醒继续，
 // 因此浏览器放后台/窗口最小化都不会中断任务（请求节奏不变，风控无感）
 const ALARM_ENRICH = 'enrichTick';
+const ALARM_HEARTBEAT = 'enrichHeartbeat';
 let tickBusy = false;
 
 function scheduleNextTick(delayMs) {
@@ -502,6 +506,10 @@ async function enrichTick() {
     }
     if (Date.now() < pausedUntil) delay = Math.max(delay, pausedUntil - Date.now());
     scheduleNextTick(delay);
+  } catch (e) {
+    // 链路自愈：任何单步异常都不允许中断闹钟链（此前跑到一半静默停的根因）
+    setStatus('WARN', `单条处理异常已跳过：${String((e && e.message) || e).slice(0, 80)}（链路自动继续）`);
+    if (state.enrichScheduled && !enrichStop) scheduleNextTick(15000);
   } finally {
     tickBusy = false;
   }
@@ -509,7 +517,16 @@ async function enrichTick() {
 
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_ENRICH) enrichTick();
+  else if (alarm.name === ALARM_HEARTBEAT) {
+    // 心跳兑底：闹钟链因任何原因断裂时，每分钟检查并重新拉起
+    if (!state.enrichScheduled || enrichStop || tickBusy) return;
+    chrome.alarms.getAll((all) => {
+      if (!all.some((a) => a.name === ALARM_ENRICH)) scheduleNextTick(2000);
+    });
+  }
 });
+// 心跳闹钟常驻（每次唤醒都重建一次，同名幂等）
+chrome.alarms.create(ALARM_HEARTBEAT, { periodInMinutes: 1, delayInMinutes: 1 });
 
 // 带重试的消息下发（content script 可能尚未就绪）
 function notifyTab(tabId, type, gapMs = 1200, maxTries = 40) {
