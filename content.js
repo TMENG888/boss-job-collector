@@ -114,10 +114,38 @@
   }
 
   function scrollStep(el) {
+    // 轻推：小幅随机滚动，用于到底后促进懒加载触发
+    const d = 60 + Math.random() * 160;
     if (IS_WINDOW_SCROLLER(el)) {
-      window.scrollBy(0, 500);
+      window.scrollBy(0, d);
     } else {
-      try { el.scrollTop += 500; } catch (e) { /* ignore */ }
+      try { el.scrollTop += d; } catch (e) { /* ignore */ }
+    }
+    try { window.dispatchEvent(new Event('scroll')); } catch (e) { /* ignore */ }
+  }
+
+  // 拟人滚动手势：一次滚轮 = 带缓动衰减的若干微步（先快后慢，模拟动量）；
+  // 幅度随机：多数 200~650px，偶发大滑 800~1400px，偶发小碎步 60~160px
+  async function humanScrollOnce(el) {
+    const r = Math.random();
+    const dist =
+      r < 0.08 ? 800 + Math.random() * 600 :
+      r < 0.2 ? 60 + Math.random() * 100 :
+      200 + Math.random() * 450;
+    const steps = 4 + Math.floor(Math.random() * 7);
+    let done = 0;
+    for (let s = 0; s < steps; s++) {
+      const remain = dist - done;
+      if (remain <= 0) break;
+      const frac = (s + 1) / steps;
+      const delta = Math.max(2, Math.round((remain * (1 - frac * 0.55)) / (steps - s)));
+      done += delta;
+      if (IS_WINDOW_SCROLLER(el)) {
+        window.scrollBy(0, delta);
+      } else {
+        try { el.scrollTop += delta; } catch (e) { /* ignore */ }
+      }
+      await sleep(20 + Math.random() * 45); // 微步间隔
     }
     try { window.dispatchEvent(new Event('scroll')); } catch (e) { /* ignore */ }
   }
@@ -127,13 +155,14 @@
     try { return el.scrollTop + el.clientHeight >= el.scrollHeight - 60; } catch (e) { return true; }
   }
 
-  // 到底后等待懒加载追加新卡片（SPA 加载中卡片数会增长）；期间补发滚动事件促进触发
+  // 到底后等待懒加载追加新卡片（SPA 加载中卡片数会增长）；
+  // 轻推节拍也拟人化：0.7~1.6s 随机间隔，不匀速
   async function waitCardsGrow(before, timeoutMs, scroller) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeoutMs) {
-      await sleep(500);
+      await sleep(700 + Math.random() * 900);
       if (findCards().length > before) return true;
-      scrollStep(scroller); // 轻推一下，触发 IntersectionObserver/scroll 监听
+      scrollStep(scroller);
     }
     return findCards().length > before;
   }
@@ -472,8 +501,19 @@
     let noGrowth = 0; // 连续到底无新内容的次数
     for (let i = 0; i < CONFIG.maxScrollSteps; i++) {
       const scroller = findScrollContainer();
-      scrollStep(scroller);
-      await sleep(CONFIG.scrollDelay + Math.random() * 250);
+      await humanScrollOnce(scroller); // 拟人手势：缓动微步+随机幅度
+      // 手势间隔：多数 0.25~0.8s；约6%阅读停顿1.5~4s；约3%回看上方岗位（真人会往回翻）
+      const dice = Math.random();
+      if (dice < 0.03 && i > 3) {
+        const up = 120 + Math.random() * 300;
+        if (IS_WINDOW_SCROLLER(scroller)) window.scrollBy(0, -up);
+        else { try { scroller.scrollTop -= up; } catch (e) { /* ignore */ } }
+        await sleep(600 + Math.random() * 900);
+      } else if (dice > 0.94) {
+        await sleep(1500 + Math.random() * 2500); // 阅读停顿
+      } else {
+        await sleep(250 + Math.random() * 550);
+      }
       await grabVisible();
       cont = await ask({ type: 'SHOULD_CONTINUE' });
       if (!cont || !cont.continue) return 'STOPPED';

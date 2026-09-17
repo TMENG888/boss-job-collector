@@ -378,7 +378,22 @@ async function warmTabDetail(link) {
     // 安检链：security.html(JS算令牌)→重定向回 job_detail。等 URL 落位（最多25s）
     let landed = await waitTabUrl(tabId, (u) => /job_detail\//.test(u || ''), 25000);
     if (!landed) {
-      // 未落位：大概率是滑块/验证页，请人工完成（完成后 callbackUrl 会自动跳回详情页）
+      // 未落位：区分“IP封禁页(403)”与“滑块/验证页”。封禁页标题也是“BOSS直聘”，
+      // 只能读正文判断；封禁时继续等待/重试毫无意义，还会延长封禁
+      let bodyText = '';
+      try {
+        const res = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: () => String((document.body && document.body.innerText) || '').slice(0, 300)
+        });
+        bodyText = (res && res[0] && res[0].result) || '';
+      } catch (e) { /* ignore */ }
+      if (/访问受限|暂时被禁止|异常行为/.test(bodyText)) {
+        return {
+          jd: '', via: 'blocked', ms: Date.now() - t0,
+          diag: { src: 'tab', title: await tabTitle(tabId), url: link, n: bodyText.length, text: 'IP/账号封禁页(访问受限)：等待解除，请勿频繁重试' }
+        };
+      }
       const title = await tabTitle(tabId);
       if (/安全验证|验证码|请稍候|security/i.test(title)) {
         setStatus('WARN', '页面出现安全验证，请在当前标签页手动完成（滑块/点选），完成后自动继续…');
@@ -387,7 +402,7 @@ async function warmTabDetail(link) {
     }
     if (!landed) {
       return {
-        jd: '', via: 'blocked',
+        jd: '', via: 'blocked', ms: Date.now() - t0,
         diag: { src: 'tab', title: await tabTitle(tabId), url: link, n: 0, text: '安检未通过（未落到详情页）' }
       };
     }
@@ -477,6 +492,9 @@ function applyDetail(key, d) {
 // 因此浏览器放后台/窗口最小化都不会中断任务（请求节奏不变，风控无感）
 const ALARM_ENRICH = 'enrichTick';
 const ALARM_HEARTBEAT = 'enrichHeartbeat';
+// 每日JD额度：账号有违规记录后，控制日均详情量是最有效的自保手段
+// （解封当天千万别急着跑满1000，建议每天300条内分多次补全）
+const DAILY_JD_CAP = 300;
 let tickBusy = false;
 
 function scheduleNextTick(delayMs) {
@@ -490,6 +508,22 @@ async function enrichTick() {
   try {
     if (Date.now() < pausedUntil) {
       scheduleNextTick(pausedUntil - Date.now() + 1000); // 熔断冷却中，等解除
+      return;
+    }
+    // 每日额度熔断：跨天自动重置；用完后休眠到次日08:00
+    const today = new Date().toDateString();
+    if (state.dailyDate !== today) {
+      state.dailyDate = today;
+      state.dailyCount = 0;
+    }
+    if ((state.dailyCount || 0) >= DAILY_JD_CAP) {
+      const next = new Date();
+      next.setHours(8, 0, 0, 0);
+      if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
+      setStatus('WARN', `已达今日JD安全额度（${DAILY_JD_CAP} 条），明早8点后自动继续（账号有违规记录，日均量需克制）`);
+      pushLog('WARN', `今日JD额度已用完（${state.dailyCount}/${DAILY_JD_CAP}），休眠至次日08:00自动继续`);
+      await saveState();
+      scheduleNextTick(next.getTime() - Date.now() + 60000);
       return;
     }
     const now = Date.now();
@@ -550,10 +584,12 @@ async function enrichTick() {
       if (blockedStreak >= 3) {
         pausedUntil = Date.now() + 90000;
         setStatus('WARN', '连续遇到安全验证，暂停90秒后自动重试；若页面有滑块请手动完成');
+        pushLog('WARN', '连续3次拦截/安检失败：熔断暂停90秒');
       }
     } else if (d.jd) {
       blockedStreak = 0;
       cleanJobs++;
+      state.dailyCount = (state.dailyCount || 0) + 1; // 每日额度计数
       if (cleanJobs % 15 === 0) slowFactor = Math.max(1, slowFactor * 0.9); // 顺利时缓慢恢复速度
       pausedUntil = 0;
     }
