@@ -91,6 +91,53 @@
   const pageHeight = () =>
     Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);
 
+  /* ====== SPA 无限滚动适配 ======
+   * BOSS 搜索页已是纯前端渲染的无限滚动列表（无"下一页"按钮，内容随滚动懒加载）。
+   * 滚动可能发生在 window 或内部容器（overflow:auto），必须找准真正的滚动主体；
+   * 到底后需等待 AJAX 追加新卡片，不能立即判定到底/采尽 */
+  const IS_WINDOW_SCROLLER = (el) =>
+    !el || el === document.scrollingElement || el === document.documentElement || el === document.body;
+
+  function findScrollContainer() {
+    const anchor = findCards()[0];
+    const cands = [];
+    try {
+      document.querySelectorAll('div,main,section,ul').forEach((el) => {
+        const cs = getComputedStyle(el);
+        if (/(auto|scroll)/.test(cs.overflowY) && el.scrollHeight > el.clientHeight + 200) cands.push(el);
+      });
+    } catch (e) { /* ignore */ }
+    if (anchor) {
+      for (const el of cands) if (el.contains(anchor)) return el;
+    }
+    return null; // 无内部滚动容器 → 滚 window
+  }
+
+  function scrollStep(el) {
+    if (IS_WINDOW_SCROLLER(el)) {
+      window.scrollBy(0, 500);
+    } else {
+      try { el.scrollTop += 500; } catch (e) { /* ignore */ }
+    }
+    try { window.dispatchEvent(new Event('scroll')); } catch (e) { /* ignore */ }
+  }
+
+  function atBottom(el) {
+    if (IS_WINDOW_SCROLLER(el)) return window.innerHeight + window.scrollY >= pageHeight() - 60;
+    try { return el.scrollTop + el.clientHeight >= el.scrollHeight - 60; } catch (e) { return true; }
+  }
+
+  // 到底后等待懒加载追加新卡片（SPA 加载中卡片数会增长）；期间补发滚动事件促进触发
+  async function waitCardsGrow(before, timeoutMs, scroller) {
+    const t0 = Date.now();
+    while (Date.now() - t0 < timeoutMs) {
+      await sleep(500);
+      if (findCards().length > before) return true;
+      scrollStep(scroller); // 轻推一下，触发 IntersectionObserver/scroll 监听
+    }
+    return findCards().length > before;
+  }
+
   function fire(msg) {
     try {
       chrome.runtime.sendMessage(msg).catch(() => {});
@@ -422,13 +469,25 @@
     let cont = await ask({ type: 'SHOULD_CONTINUE' });
     if (!cont || !cont.continue) return 'STOPPED';
 
+    let noGrowth = 0; // 连续到底无新内容的次数
     for (let i = 0; i < CONFIG.maxScrollSteps; i++) {
-      window.scrollBy(0, 500);
+      const scroller = findScrollContainer();
+      scrollStep(scroller);
       await sleep(CONFIG.scrollDelay + Math.random() * 250);
       await grabVisible();
-      if (window.innerHeight + window.scrollY >= pageHeight() - 60) break;
       cont = await ask({ type: 'SHOULD_CONTINUE' });
       if (!cont || !cont.continue) return 'STOPPED';
+      // 到底后等懒加载：BOSS SPA 靠滚动触发 AJAX 追加，追加完成前不算到底
+      if (atBottom(scroller)) {
+        const before = findCards().length;
+        const grew = await waitCardsGrow(before, 9000, scroller);
+        if (grew) {
+          noGrowth = 0;
+          await grabVisible(); // 新卡片立即入库
+        } else if (++noGrowth >= 2) {
+          break; // 连续两次到底无新增 → 真没有更多了
+        }
+      }
     }
     return 'PAGE_DONE';
   }
@@ -515,10 +574,17 @@
 
   async function gotoNextPage() {
     const before = firstCardKey();
-    const countBefore = findCards().length;
     const btn = findNextButton();
 
-    if (btn && !isDisabled(btn)) {
+    // BOSS 搜索页已是无限滚动 SPA：无分页按钮属正常，采集阶段已在 collectPageIncrementally
+    // 中做到底部喂滚与懒加载等待——这里直接如实报告，交由后台切换下一搜索词
+    if (!btn) {
+      report('RUN', '当前为无限滚动列表且已滚动到底（无更多新内容），本搜索词采尽');
+      return false;
+    }
+
+    // 以下为传统分页（MPA）兑底：BOSS 若对部分列表保留"下一页"按钮则仍可用
+    if (!isDisabled(btn)) {
       btn.click();
       const t0 = Date.now();
       while (Date.now() - t0 < CONFIG.pageChangeTimeout) {
@@ -535,11 +601,11 @@
       }
       report('WARN', `点击下一页无反应（等待 ${Math.round(CONFIG.pageChangeTimeout / 1000)}s 内容未变化），改用直接跳转第 ${curPageNo() + 1} 页…`);
     } else {
-      report('WARN', `未找到可用的"下一页"按钮（可能被禁用/改版），改用直接跳转第 ${curPageNo() + 1} 页…`);
+      report('RUN', '"下一页"按钮已置灰，本搜索词采尽');
+      return false;
     }
 
-    // 兕底：直接按页码跳 URL。对平台而言与点击下一页是同一种同标签页导航，无额外风险；
-    // sessionStorage 记录跳页前状态，供落地页校验（防 BOSS 把页码重置回第1页导致死循环）
+    // 点击无反应时的兑底：按页码直接跳 URL（同标签页导航，与手点无异）
     try {
       sessionStorage.setItem('__boss_prev_first', before || '');
       sessionStorage.setItem('__boss_next_page', String(curPageNo() + 1));
