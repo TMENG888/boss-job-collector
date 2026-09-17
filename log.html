@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>BOSS岗位采集助手 - 当日运行日志</title>
+<style>
+  body { margin: 0; font: 13px/1.6 Consolas, "Courier New", "Microsoft YaHei", monospace; background: #14161a; color: #d6d9de; }
+  header { position: sticky; top: 0; background: #1b1e24; padding: 10px 16px; border-bottom: 1px solid #2a2e36; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  header h1 { font-size: 14px; margin: 0 12px 0 0; color: #00bebc; }
+  .chip { padding: 3px 10px; border-radius: 12px; border: 1px solid #3a3f49; background: transparent; color: #9aa3af; cursor: pointer; font-size: 12px; }
+  .chip.on { background: #00bebc22; border-color: #00bebc; color: #00bebc; }
+  input[type="text"] { padding: 4px 8px; border-radius: 6px; border: 1px solid #3a3f49; background: #101216; color: #d6d9de; width: 200px; }
+  label.chk { color: #9aa3af; font-size: 12px; display: flex; align-items: center; gap: 4px; }
+  button.act { padding: 4px 10px; border-radius: 6px; border: 1px solid #3a3f49; background: #232830; color: #c8cdd6; cursor: pointer; font-size: 12px; }
+  button.act:hover { border-color: #00bebc; color: #00bebc; }
+  .stat { color: #6d7683; font-size: 12px; margin-left: auto; }
+  .stat b { color: #e5c07b; } .stat .err { color: #e06c75; } .stat .warn { color: #e5c07b; }
+  #log { padding: 10px 16px 30px; white-space: pre-wrap; word-break: break-all; font-size: 12px; }
+  .line { padding: 1px 0; }
+  .INFO { color: #9fb6cd; } .OK { color: #7ec97e; } .WARN { color: #e5c07b; }
+  .ERROR { color: #e06c75; } .ACTION { color: #c678dd; } .SYS { color: #6d7683; }
+  .empty { color: #6d7683; padding: 30px 0; text-align: center; }
+</style>
+</head>
+<body>
+  <header>
+    <h1>当日运行日志</h1>
+    <span class="chip on" data-lv="ALL">全部</span>
+    <span class="chip" data-lv="INFO">信息</span>
+    <span class="chip" data-lv="OK">成功</span>
+    <span class="chip" data-lv="WARN">警告</span>
+    <span class="chip" data-lv="ERROR">错误</span>
+    <input type="text" id="q" placeholder="搜索关键字…">
+    <label class="chk"><input type="checkbox" id="auto" checked>自动刷新</label>
+    <button class="act" id="copyBtn">复制</button>
+    <button class="act" id="dlBtn">下载TXT</button>
+    <button class="act" id="clearBtn">清空</button>
+    <span class="stat" id="stat"></span>
+  </header>
+  <div id="log"><div class="empty">加载中…</div></div>
+  <script src="log.js"></script>
+</body>
+</html>

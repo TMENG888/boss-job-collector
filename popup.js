@@ -132,6 +132,7 @@ $('jdBtn').addEventListener('click', () => chrome.runtime.sendMessage({
 }));
 $('sanitizeBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'SANITIZE' }));
 $('clearBtn').addEventListener('click', () => chrome.runtime.sendMessage({ type: 'CLEAR' }));
+$('logBtn').addEventListener('click', () => chrome.tabs.create({ url: chrome.runtime.getURL('log.html') }));
 
 (async () => {
   const d = await chrome.storage.local.get(SETTINGS_KEY);

@@ -56,6 +56,7 @@ function setStatus(s, m) {
   // JD 补全链在任何 SW 唤醒时自动续跑（含浏览器重启后；纯本地恢复，安全）
   if (!state.running && state.enrichScheduled && state.collected.length) {
     enrichStop = false;
+    pushLog('SYS', 'SW唤醒：自动续跑JD补全');
     scheduleNextTick(8000);
   }
   if (!bootstrapped) return; // 浏览器冷启动：列表采集任务不自动恢复（沿用既有语义）
@@ -96,6 +97,37 @@ chrome.runtime.onStartup.addListener(() => {
     }
   });
 });
+
+/* ---------- 当日运行日志 ---------- */
+// 仅保留当天的环形日志（跨天自动清空，上限3000行），供 log.html 页面查看与排错
+const LOG_KEY = 'boss_log';
+let logCache = { date: '', lines: [] };
+let logTouched = false;
+let logSaveTimer = null;
+
+async function loadLog() {
+  try {
+    const d = await chrome.storage.local.get(LOG_KEY);
+    if (!logTouched) logCache = d[LOG_KEY] || logCache;
+  } catch (e) { /* ignore */ }
+}
+loadLog();
+
+function pushLog(level, msg) {
+  const now = new Date();
+  const today = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+  if (logCache.date !== today) logCache = { date: today, lines: [] }; // 跨天：仅保留当天
+  const ts = `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`;
+  logCache.lines.push(`[${ts}] [${level}] ${msg}`);
+  if (logCache.lines.length > 3000) logCache.lines.splice(0, logCache.lines.length - 3000);
+  logTouched = true;
+  if (!logSaveTimer) {
+    logSaveTimer = setTimeout(() => { // 合并写入，避免高频存储抖动
+      logSaveTimer = null;
+      chrome.storage.local.set({ [LOG_KEY]: logCache }).catch(() => {});
+    }, 800);
+  }
+}
 
 /* ---------- 工具 ---------- */
 function snapshot() {
@@ -205,6 +237,7 @@ async function manualStop(reason) {
   state.enrichScheduled = false;
   enrichStop = true; // 同步中断闹钟驱动的 JD 采集
   try { await chrome.alarms.clear(ALARM_ENRICH); } catch (e) { /* ignore */ }
+  pushLog('ACTION', '手动停止：' + reason);
   await saveState();
   setStatus('STOPPED', reason);
   tellTabStop(); // 手动停止 = 全部停止；缺 JD 可之后点"补全JD"
@@ -218,6 +251,7 @@ function scheduleEnrich() {
   enrichStop = false;
   saveState();
   setStatus('ENRICH', '开始补全JD详情（模拟真人点击进出详情页，可后台运行）…');
+  pushLog('ACTION', '调度JD补全（闹钟驱动，可后台）');
   scheduleNextTick(3000);
 }
 
@@ -483,6 +517,7 @@ async function enrichTick() {
           ? ` · ${d.diag.title || '无标题'}(${d.diag.n || '?'}字)${d.diag.text ? ' ' + String(d.diag.text).slice(0, 60) : ''}`
           : ' · 未取到JD，稍后重试';
     setStatus('ENRICH', `JD获取中：已完成 ${done}/${state.collected.length}（还剩 ${pendingCount()}）${tag}`);
+    pushLog(d.jd ? 'OK' : 'WARN', `JD ${state.collected.indexOf(j) + 1}/${state.collected.length} ${d.jd ? '✓' + (d.jdVia || '') : '✗未取到'} · ${(d.ms / 1000).toFixed(1)}s · ${j.name}${d.diag ? ' · ' + (d.diag.title || '') + `(${d.diag.n || '?'}字)` : ''}`);
 
     // 计算下一步延迟（含风控应对与拟人节奏），以闹钟形式安排
     let delay = nextDelayMs();
@@ -493,6 +528,7 @@ async function enrichTick() {
         // 首次拦截就冷却：封禁期间继续请求只会延长封禁
         delay = 30000 + Math.random() * 30000;
         setStatus('WARN', '遇到风控拦截，冷却约1分钟后继续（已自动降低整体速度）…');
+        pushLog('WARN', `风控拦截：冷却${Math.round(delay / 1000)}s，整体减速×1.5=${slowFactor.toFixed(2)}`);
       }
       if (blockedStreak >= 3) {
         pausedUntil = Date.now() + 90000;
@@ -509,6 +545,7 @@ async function enrichTick() {
   } catch (e) {
     // 链路自愈：任何单步异常都不允许中断闹钟链（此前跑到一半静默停的根因）
     setStatus('WARN', `单条处理异常已跳过：${String((e && e.message) || e).slice(0, 80)}（链路自动继续）`);
+    pushLog('ERROR', `单步异常跳过：${String((e && e.stack) || e).slice(0, 400)}`);
     if (state.enrichScheduled && !enrichStop) scheduleNextTick(15000);
   } finally {
     tickBusy = false;
@@ -521,7 +558,10 @@ chrome.alarms.onAlarm.addListener((alarm) => {
     // 心跳兑底：闹钟链因任何原因断裂时，每分钟检查并重新拉起
     if (!state.enrichScheduled || enrichStop || tickBusy) return;
     chrome.alarms.getAll((all) => {
-      if (!all.some((a) => a.name === ALARM_ENRICH)) scheduleNextTick(2000);
+      if (!all.some((a) => a.name === ALARM_ENRICH)) {
+        pushLog('SYS', '心跳检测到闹钟链断裂，已重新拉起');
+        scheduleNextTick(2000);
+      }
     });
   }
 });
@@ -574,6 +614,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         state.enrichScheduled = false;
         state.concurrency = Math.max(1, Math.min(6, parseInt(msg.concurrency, 10) || 1));
         setStatus('RUN', '正在打开/定位搜索页面…');
+        pushLog('ACTION', `开始采集：${(msg.urls && msg.urls.length) || 1} 个搜索词 · 目标 ${state.target} · 自动JD=${state.enrich}`);
         await saveState();
         try {
           const tab = await openSearchPage(state.searchUrl);
@@ -597,6 +638,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           state.searchUrl = state.queue[state.queueIndex];
           // 注意：状态用 SWITCH 而非 RUN，避免随后的 LOOP_END 误判为异常停止而中断接力
           setStatus('SWITCH', `当前搜索词已采尽，自动切换下一搜索词（${state.queueIndex + 1}/${state.queue.length}）…`);
+          pushLog('ACTION', `搜索词采尽，接力切换 ${state.queueIndex + 1}/${state.queue.length}：${state.searchUrl}`);
           await saveState();
           try { await chrome.tabs.update(activeTabId, { url: state.searchUrl }); } catch (e) { /* ignore */ }
           sendResponse({ ok: true, next: true });
@@ -647,6 +689,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         if (state.collected.length >= state.target) {
           state.running = false;
           setStatus('DONE', `已达目标数量（${state.target} 条），开始补全JD详情…`);
+          pushLog('OK', `列表采集完成，共 ${state.collected.length} 条（达标），转入JD补全`);
           tellTabStop();
           scheduleEnrich();
         } else {
@@ -706,11 +749,16 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         break;
       }
 
-      case 'STATUS':
+      case 'STATUS': {
         // 任务已结束后忽略普通进度，但保留 DONE/ERROR/WARN 等最终态
         if (state.running || msg.status !== 'RUN') setStatus(msg.status, msg.message);
+        const LOGGED = ['WARN', 'ERROR', 'STOPPED', 'DONE', 'SWITCH', 'WAIT_CAPTCHA'];
+        if (LOGGED.includes(msg.status)) {
+          pushLog(msg.status === 'DONE' ? 'OK' : msg.status === 'SWITCH' || msg.status === 'WAIT_CAPTCHA' ? 'WARN' : msg.status, String(msg.message || '').slice(0, 300));
+        }
         sendResponse({ ok: true });
         break;
+      }
 
       case 'LOOP_END':
         if (state.running && status.status === 'RUN') {
