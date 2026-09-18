@@ -19,3 +19,6 @@ build/
 *.crx
 *.pem
 _test_links.txt
+# 测试脚手架（CDP 实验脚本，不随扩展发布）
+_bg_*.js
+_mock_*.html

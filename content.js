@@ -125,8 +125,18 @@
   }
 
   // 拟人滚动手势：一次滚轮 = 带缓动衰减的若干微步（先快后慢，模拟动量）；
-  // 幅度随机：多数 200~650px，偶发大滑 800~1400px，偶发小碎步 60~160px
+  // 幅度随机：多数 200~650px，偶发大滑 800~1400px，偶发小碎步 60~160px。
+  // 每次手势后合成派发 scroll 事件——【实测关键】隐藏标签页渲染冻结，
+  // 真实滚动事件永不触发，BOSS 的懒加载器靠它唤醒；到底时先上滚再下滚
+  // 保证位置变化 + 哨兵重入（否则加载器再也不触发）
   async function humanScrollOnce(el) {
+    const wasBottom = atBottom(el);
+    if (wasBottom) {
+      // 到底时先上滚：位置不变不会产生滚动事件，哨兵也不会重入，加载器会饿死
+      if (IS_WINDOW_SCROLLER(el)) window.scrollBy(0, -400);
+      else { try { el.scrollTop -= 400; } catch (e) { /* ignore */ } }
+      await sleep(80 + Math.random() * 120);
+    }
     const r = Math.random();
     const dist =
       r < 0.08 ? 800 + Math.random() * 600 :
@@ -474,71 +484,39 @@
   }
 
   /* ================= 逐屏增量采集（够数即停） ================= */
-  async function collectPageIncrementally() {
-    const seen = new Set();
-    const grabVisible = async () => {
-      const fresh = [];
-      for (const c of findCards()) {
-        const j = await parseCardAsync(c);
-        if (!j) continue;
-        const k = j.link || `${j.name}|${j.company}|${j.salary}`;
-        if (seen.has(k)) continue;
-        seen.add(k);
-        fresh.push(j);
-      }
-      if (fresh.length) {
-        fire({ type: 'BATCH', jobs: fresh });
-        await sleep(250);
-      }
-      return fresh.length;
-    };
+  /* ================= 列表采集：单步模式（由后台闹钟 LIST_STEP 驱动） =================
+   * 【实测依据】（_bg_scroll_test.js / _bg_probe2.js，headless Chrome + intensive 节流）
+   * 1. 隐藏标签页中 350~600ms 链式定时器被 intensive 节流到 ~1次/分：自驱动循环
+   *    几步内就误判采尽假死（3 次手势即停）→ 任务停在几十条；
+   * 2. 隐藏页 scrollY 会变但 scroll 事件永不触发（由冻结的渲染管线派发）→
+   *    BOSS 懒加载器饿死 → 必须每步后合成派发 scroll 事件唤醒；
+   * 3. 到底时需先上滚再下滚（位置不变无事件、哨兵不重入）；
+   * 4. 后台 Runtime 驱动的单步不受页面定时器节流（30 手势/分 vs 1/分）。
+   * 因此采集循环迁入后台闹钟状态机，页面只提供“一步”原语。
+   */
+  const seenJobs = new Set();
+  function resetSeenJobs() { seenJobs.clear(); }
 
-    // 首屏可见的卡片（通常就有 10~30 条，目标小的话到这就够了）
-    await grabVisible();
-    let cont = await ask({ type: 'SHOULD_CONTINUE' });
-    if (!cont || !cont.continue) return 'STOPPED';
-
-    let noGrowth = 0; // 连续到底无新内容的次数
-    for (let i = 0; i < CONFIG.maxScrollSteps; i++) {
-      const scroller = findScrollContainer();
-      await humanScrollOnce(scroller); // 拟人手势：缓动微步+随机幅度
-      // 手势间隔：多数 0.25~0.8s；约6%阅读停顿1.5~4s；约3%回看上方岗位（真人会往回翻）
-      const dice = Math.random();
-      if (dice < 0.03 && i > 3) {
-        const up = 120 + Math.random() * 300;
-        if (IS_WINDOW_SCROLLER(scroller)) window.scrollBy(0, -up);
-        else { try { scroller.scrollTop -= up; } catch (e) { /* ignore */ } }
-        await sleep(600 + Math.random() * 900);
-      } else if (dice > 0.94) {
-        await sleep(1500 + Math.random() * 2500); // 阅读停顿
-      } else {
-        await sleep(250 + Math.random() * 550);
-      }
-      await grabVisible();
-      cont = await ask({ type: 'SHOULD_CONTINUE' });
-      if (!cont || !cont.continue) return 'STOPPED';
-      // 到底后等懒加载：BOSS SPA 靠滚动触发 AJAX 追加，追加完成前不算到底
-      if (atBottom(scroller)) {
-        const before = findCards().length;
-        const grew = await waitCardsGrow(before, 9000, scroller);
-        if (grew) {
-          noGrowth = 0;
-          await grabVisible(); // 新卡片立即入库
-        } else if (++noGrowth >= 2) {
-          break; // 连续两次到底无新增 → 真没有更多了
-        }
-      }
+  async function grabVisible() {
+    const fresh = [];
+    for (const c of findCards()) {
+      const j = await parseCardAsync(c);
+      if (!j) continue;
+      const k = j.link || `${j.name}|${j.company}|${j.salary}`;
+      if (seenJobs.has(k)) continue;
+      seenJobs.add(k);
+      fresh.push(j);
     }
-    return 'PAGE_DONE';
+    if (fresh.length) {
+      fire({ type: 'BATCH', jobs: fresh });
+      await sleep(250);
+    }
+    return fresh.length;
   }
 
-  async function scrollThroughPage() {
-    for (let i = 0; i < CONFIG.maxScrollSteps; i++) {
-      window.scrollBy(0, 500);
-      await sleep(CONFIG.scrollDelay + Math.random() * 250);
-      if (window.innerHeight + window.scrollY >= pageHeight() - 60) break;
-    }
-  }
+  // 单步初始化（幂等）：跳页落地守卫。返回 null=正常 / 'exhausted'=跳页未生效判采尽
+  let initDone = false;
+  let jumpCheck = null; // { prevFirst } 跳页后首卡内容校验
 
   /* ================= 安全验证 / 卡片等待 ================= */
   function detectCaptcha() {
@@ -565,13 +543,6 @@
   }
 
   /* ================= 翻页 ================= */
-  function firstCardKey() {
-    const c = findCards()[0];
-    if (!c) return '';
-    const a = c.querySelector('a[href]');
-    return a ? a.getAttribute('href') : txt(c).slice(0, 40);
-  }
-
   function findNextButton() {
     for (const s of SEL.next) {
       const el = document.querySelector(s);
@@ -616,8 +587,8 @@
     const before = firstCardKey();
     const btn = findNextButton();
 
-    // BOSS 搜索页已是无限滚动 SPA：无分页按钮属正常，采集阶段已在 collectPageIncrementally
-    // 中做到底部喂滚与懒加载等待——这里直接如实报告，交由后台切换下一搜索词
+    // BOSS 搜索页已是无限滚动 SPA：无分页按钮属正常（页面滚动已由后台闹钟单步
+    // 驱动 humanScrollOnce 完成），这里直接如实报告，交由后台切换下一搜索词
     if (!btn) {
       report('RUN', '当前为无限滚动列表且已滚动到底（无更多新内容），本搜索词采尽');
       return false;
@@ -820,11 +791,26 @@
   /* ================= 主流程 ================= */
   let running = false;
 
-  async function begin() {
-    if (running) return;
-    running = true;
-    let pageNo = curPageNo();
-    // 直接跳页落地校验（见 gotoNextPage 兕底逻辑）：
+  /* 列表采集改为后台闹钟驱动的单步模式（LIST_STEP / LIST_ADVANCE）。
+   * 【实测依据】（_bg_scroll_test.js，headless Chrome + intensive 节流）：
+   * 旧版页面内自驱动循环在隐藏标签页中被定时器节流到 ~1次/分，
+   * 几步就误判采尽假死（用户日志：停在 60/1000，“内容脚本已停止”）。
+   * 后台 Runtime 驱动的单步不受节流（30 手势/分 vs 1/分）。
+   */
+  function startRunning() {
+    if (!running) {
+      running = true;
+      initDone = false;
+      jumpCheck = null;
+      resetSeenJobs();
+    }
+  }
+
+  // 首步初始化：跳页落地守卫（幂等）。返回 null=正常 / 'exhausted'=跳页未生效判采尽
+  async function ensureInit() {
+    if (initDone) return null;
+    initDone = true;
+    resetSeenJobs();
     let jumpWanted = 0;
     let jumpPrevFirst = '';
     try {
@@ -832,75 +818,97 @@
       jumpPrevFirst = sessionStorage.getItem('__boss_prev_first') || '';
       sessionStorage.removeItem('__boss_next_page');
       sessionStorage.removeItem('__boss_prev_first');
-      if (jumpWanted && pageNo !== jumpWanted) {
+      if (jumpWanted && curPageNo() !== jumpWanted) {
         // BOSS 把页码重置了（如该词只有一页，跳第2页被弹回第1页）→ 真采尽
-        report('WARN', `跳页未生效（落在第 ${pageNo} 页），判定该搜索词已采尽`);
-        fire({ type: 'EXHAUSTED' });
-        return;
+        report('WARN', `跳页未生效（落在第 ${curPageNo()} 页），判定该搜索词已采尽`);
+        return 'exhausted';
       }
     } catch (e) { /* ignore */ }
+    if (jumpPrevFirst) jumpCheck = { prevFirst: jumpPrevFirst };
+    return null;
+  }
+
+  function firstCardKey() {
+    const cards = findCards();
+    if (!cards.length) return '';
+    const a = cards[0].querySelector('a[href*="/job_detail/"]');
+    return a ? a.getAttribute('href') : '';
+  }
+
+  // 单步手势 + 抓取（无页内等待：隐藏页的定时器轮询会被节流拖慢，
+  // 等待/节奏/重试全部由后台闹钟控制；防重入：上一步未返回前直接 busy）
+  let stepBusy = false;
+  async function listStep() {
+    if (stepBusy) return { busy: true };
+    stepBusy = true;
     try {
-      while (running) {
-        report('RUN', `第 ${pageNo} 页：等待岗位列表渲染…`);
-        const w = await waitCards(CONFIG.cardWaitTimeout);
-        if (!w.ok) {
-          if (w.captcha) {
-            report('WAIT_CAPTCHA', '检测到安全验证，请在页面上手动完成，完成后自动继续…');
-            if (await waitCaptchaGone()) continue;
-            report('ERROR', '等待安全验证超时，已停止');
-          } else if (/访问受限|暂时被禁止访问/.test((document.body && document.body.innerText) || '')) {
-            report('ERROR', 'IP 已被 BOSS 限制访问（"访问受限"页）。请等限制解除（页面有恢复时间）再重新开始；已采数据可先导出');
-          } else {
-            report('ERROR', '未找到岗位列表：请确认已登录，且当前页面是职位搜索结果页');
-          }
-          break;
+      if (detectCaptcha()) return { captcha: true, cards: 0, atBottom: false };
+      const guard = await ensureInit();
+      if (guard === 'exhausted') return { exhausted: true };
+      if (!findCards().length) {
+        if (/访问受限|暂时被禁止访问/.test((document.body && document.body.innerText) || '')) {
+          return { blocked: true };
         }
-
-        report('RUN', `第 ${pageNo} 页：逐屏读取岗位数据（够数即停）…`);
-        // 跳页落地内容校验：内容与跳页前一致（页码被重置/缓存）→ 采尽，防死循环
-        if (jumpWanted && jumpPrevFirst) {
-          const nowFirst = firstCardKey();
-          if (nowFirst && nowFirst === jumpPrevFirst) {
-            report('WARN', '跳页后列表内容与上一页相同，判定该搜索词已采尽');
-            fire({ type: 'EXHAUSTED' });
-            return;
-          }
-          jumpWanted = 0; // 校验只做一次
-        }
-        const res = await collectPageIncrementally();
-        if (res === 'STOPPED') break; // 达标/手动停止，状态由后台展示
-
-        report('RUN', `第 ${pageNo} 页已读完，准备翻页…`);
-        const moved = await gotoNextPage();
-        if (!moved) {
-          fire({ type: 'EXHAUSTED' }); // 交给后台：切换下一个搜索词或收尾补全
-          break;
-        }
-        pageNo++;
-        await sleep(CONFIG.pageDelay[0] + Math.random() * (CONFIG.pageDelay[1] - CONFIG.pageDelay[0])); // 模拟人工翻页节奏
-        if (Math.random() < 0.25) {
-          const long = 12000 + Math.random() * 18000; // 约四分之一翻页后长休一次，避免匀速高频触发风控
-          report('RUN', `已连续翻页多页，模拟真人休息 ${Math.round(long / 1000)}s…`);
-          await sleep(long);
+        return { cards: 0, atBottom: false }; // 首屏未渲染：后台隔步重试
+      }
+      // 跳页落地内容校验（一次性）：列表与跳页前相同 → 采尽，防死循环
+      if (jumpCheck && findCards().length) {
+        const nowFirst = firstCardKey();
+        const prev = jumpCheck.prevFirst;
+        jumpCheck = null;
+        if (nowFirst && nowFirst === prev) {
+          report('WARN', '跳页后列表内容与上一页相同，判定该搜索词已采尽');
+          return { exhausted: true };
         }
       }
-    } catch (e) {
-      report('ERROR', '运行出错：' + (e && e.message));
+      const scroller = findScrollContainer();
+      await humanScrollOnce(scroller); // 拟人手势（含合成 scroll 派发唤醒懒加载器）
+      const added = await grabVisible();
+      return {
+        cards: findCards().length,
+        added,
+        atBottom: atBottom(scroller),
+        captcha: detectCaptcha()
+      };
+    } finally {
+      stepBusy = false;
     }
-    running = false;
-    fire({ type: 'LOOP_END' });
   }
+
 
   /* ================= 消息入口 ================= */
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (msg.type === 'START') {
-      begin();
+      startRunning(); // 采集循环由后台闹钟驱动，页面只提供单步原语
       sendResponse({ ok: true });
     } else if (msg.type === 'STOP') {
       running = false;
       sendResponse({ ok: true });
     } else if (msg.type === 'PING') {
       sendResponse({ ok: true, cards: findCards().length });
+    } else if (msg.type === 'LIST_STEP') {
+      // 一步：初始化守卫 + 一次拟人手势 + 抓取可见卡片。不应答超时由后台重建
+      listStep()
+        .then((r) => sendResponse({ ok: true, ...r }))
+        .catch((e) => sendResponse({ ok: false, error: String((e && e.message) || e).slice(0, 160) }));
+      return true; // 异步应答
+    } else if (msg.type === 'LIST_ADVANCE') {
+      // 本页采尽后的翻页原语：点击下一页 / URL 跳页；无按钮 = SPA 已到底（返回 none）
+      (async () => {
+        try {
+          const moved = await gotoNextPage();
+          let action = moved ? 'clicked' : 'none';
+          if (!moved) {
+            try {
+              if (sessionStorage.getItem('__boss_next_page')) action = 'jumped';
+            } catch (e) { /* ignore */ }
+          }
+          sendResponse({ ok: true, action });
+        } catch (e) {
+          sendResponse({ ok: true, action: 'none' });
+        }
+      })();
+      return true;
     } else if (msg.type === 'EXTRACT_DETAIL') {
       // 详情页内的提取请求（后台热标签页通道）
       try {
@@ -918,7 +926,7 @@
   // 页面加载后：若后台任务正在进行且本标签页就是任务页，则自动继续（应对中途刷新/跳转）
   try {
     chrome.runtime.sendMessage({ type: 'IS_RUNNING' }, (resp) => {
-      if (resp && resp.running) begin();
+      if (resp && resp.running) startRunning();
     });
   } catch (e) { /* ignore */
   }

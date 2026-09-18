@@ -66,7 +66,13 @@ function setStatus(s, m) {
       }
     });
   }
-  if (!bootstrapped) return; // 浏览器冷启动：列表采集任务不自动恢复（沿用既有语义）
+  if (!bootstrapped) { // 浏览器冷启动：若任务仍在运行，也拉起列表闹钟链（采集中重启浏览器）
+    if (state.running && !state.enrichScheduled) {
+      enrichStop = false;
+      scheduleNextListTick(8000);
+    }
+    return;
+  }
   // SW 曾被休眠重启（浏览器未重启）：恢复正在进行的列表采集现场
   if (state.running) {
     try {
@@ -87,6 +93,8 @@ function setStatus(s, m) {
     }
     setStatus('RUN', '检测到任务曾被中断，已自动恢复采集…');
     notifyTab(activeTabId, 'START', 1200, 30);
+    enrichStop = false;
+    scheduleNextListTick(5000); // 列表闹钟链也随 SW 唤醒恢复（v1.5.0）
   } else if (state.enrichScheduled && state.collected.length) {
     // JD补全曾中断（enrichScheduled 已置位）：直接安排下一闹钟，勿走 scheduleEnrich（会因已置位被拒）
     enrichStop = false;
@@ -241,6 +249,7 @@ async function manualStop(reason) {
   state.enrichScheduled = false;
   enrichStop = true; // 同步中断闹钟驱动的 JD 采集
   try { await chrome.alarms.clear(ALARM_ENRICH); } catch (e) { /* ignore */ }
+  try { await chrome.alarms.clear(ALARM_LIST); } catch (e) { /* ignore */ }
   pushLog('ACTION', '手动停止：' + reason);
   await saveState();
   setStatus('STOPPED', reason);
@@ -669,15 +678,190 @@ async function enrichTick() {
   }
 }
 
+/* ================= 列表采集：闹钟驱动的单步状态机（v1.5.0） =================
+ * 与 enrichTick 同架构：每步向任务标签页发 LIST_STEP（一次拟人手势+抓取），
+ * 依据返回决定下一步节奏。SW 随便休眠，闹钟到点唤醒继续。
+ * 【实测依据】隐藏标签页中页面内自驱动循环被定时器节流到 ~1次/分、
+ * scroll 事件永不触发（BOSS 懒加载器饿死）→ 假死停在首屏几十条；
+ * 后台 Runtime 驱动的单步 + 页面内合成 scroll 派发实测可持续加载（30 手势/分）。
+ */
+const ALARM_LIST = 'listTick';
+let listBusy = false;
+let lastListCards = 0;   // 上一步的卡片数（用于无增长判定）
+let listNoGrowth = 0;    // 连续“到底且无新增”轮数（≥3 才判采尽，绝不因一两轮误判）
+let listCaptRounds = 0;  // 安全验证等待轮数
+let listZeroRounds = 0;  // 连续无卡片轮数（列表页异常保护）
+
+function scheduleNextListTick(delayMs) {
+  if (enrichStop || !state.running) return;
+  chrome.alarms.create(ALARM_LIST, { when: Date.now() + Math.max(800, delayMs) });
+}
+
+// 带超时的单发消息；gone=标签页/脚本丢失，timeout=应答超时（脚本可能还在忙）
+function sendToTabMsg(tabId, msg, timeoutMs = 12000) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (!settled) { settled = true; resolve({ timeout: true }); }
+    }, timeoutMs);
+    try {
+      chrome.tabs.sendMessage(tabId, msg, (resp) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (chrome.runtime.lastError) resolve({ gone: true, error: chrome.runtime.lastError.message });
+        else resolve(resp || { gone: true, error: 'empty response' });
+      });
+    } catch (e) {
+      settled = true;
+      clearTimeout(timer);
+      resolve({ gone: true, error: String((e && e.message) || e) });
+    }
+  });
+}
+
+// 当前搜索词采尽：切换队列下一个 / 收尾补全。返回是否还有下一个
+async function handleExhausted() {
+  if (state.running && state.queueIndex + 1 < (state.queue || []).length) {
+    state.queueIndex++;
+    state.searchUrl = state.queue[state.queueIndex];
+    setStatus('SWITCH', `当前搜索词已采尽，自动切换下一搜索词（${state.queueIndex + 1}/${state.queue.length}）…`);
+    pushLog('ACTION', `搜索词采尽，接力切换 ${state.queueIndex + 1}/${state.queue.length}：${state.searchUrl}`);
+    await saveState();
+    try {
+      await chrome.tabs.update(activeTabId, { url: state.searchUrl });
+      notifyTab(activeTabId, 'START', 1000, 45); // 新页面注入后自动续采
+    } catch (e) { /* ignore */ }
+    scheduleNextListTick(9000 + Math.random() * 6000); // 切词休息
+    return true;
+  }
+  // 队列也空了：收尾并补全 JD
+  state.running = false;
+  const total = state.collected.length;
+  setStatus('DONE', `全部搜索词采集完毕，共 ${total} 条（BOSS 单搜索词上限约300条，可增加关键词扩大范围）`);
+  await saveState();
+  scheduleEnrich();
+  return false;
+}
+
+async function listTick() {
+  if (listBusy || enrichStop || !state.running || state.enrichScheduled) return;
+  listBusy = true;
+  try {
+    if (Date.now() < pausedUntil) {
+      scheduleNextListTick(pausedUntil - Date.now() + 1000);
+      return;
+    }
+    if (activeTabId == null) {
+      await recoverTab();
+      scheduleNextListTick(5000);
+      return;
+    }
+    const resp = await sendToTabMsg(activeTabId, { type: 'LIST_STEP' });
+    if (resp.timeout || resp.busy) {
+      // 页面在忙（上一步还没返回）；过会再问，不算故障
+      scheduleNextListTick(3000 + Math.random() * 2000);
+      return;
+    }
+    if (resp.gone || !resp.ok) {
+      pushLog('WARN', `列表步进失败：${String(resp.error || '标签页无响应').slice(0, 100)}，尝试恢复标签页`);
+      await recoverTab();
+      notifyTab(activeTabId, 'START', 1200, 30);
+      scheduleNextListTick(5000);
+      return;
+    }
+    if (resp.exhausted) {
+      // 跳页守卫判定采尽
+      await handleExhausted();
+      return;
+    }
+    if (resp.blocked) {
+      state.running = false;
+      enrichStop = true;
+      await saveState();
+      setStatus('ERROR', 'IP 已被 BOSS 限制访问（"访问受限"页）。已停止采集，已采数据可导出；待限制解除后再开始');
+      pushLog('ERROR', '列表阶段检测到IP封禁页，任务停止');
+      return;
+    }
+    if (resp.captcha) {
+      listCaptRounds++;
+      if (listCaptRounds > 30) {
+        state.running = false;
+        enrichStop = true;
+        await saveState();
+        setStatus('ERROR', '安全验证等待超时（5分钟），已停止。完成后可重新开始');
+        pushLog('ERROR', '列表阶段安全验证等待超时，任务停止');
+        return;
+      }
+      setStatus('WAIT_CAPTCHA', '检测到安全验证，请在页面上手动完成（等待中，采到 ' + state.collected.length + ' 条）…');
+      pushLog('WARN', `列表阶段安全验证：等待人工完成（第 ${listCaptRounds}/30 轮）`);
+      scheduleNextListTick(10000);
+      return;
+    }
+    listCaptRounds = 0;
+    if (!resp.cards) {
+      if (++listZeroRounds > 20) {
+        state.running = false;
+        enrichStop = true;
+        await saveState();
+        setStatus('ERROR', '未找到岗位列表：请确认已登录，且当前页面是职位搜索结果页');
+        pushLog('ERROR', '列表阶段连续无卡片，任务停止');
+        return;
+      }
+      // 首屏还没渲染：隔步重试，间隔逐渐放大（最长15s）
+      scheduleNextListTick(Math.min(15000, 2500 + listZeroRounds * 1000 + Math.random() * 1500));
+      return;
+    }
+    listZeroRounds = 0;
+    // 底部无增长判定：间隔式多次确认，绝不因一两轮而误判
+    if (resp.atBottom && resp.cards === lastListCards) listNoGrowth++;
+    else listNoGrowth = 0;
+    lastListCards = resp.cards;
+    if (listNoGrowth >= 3) {
+      listNoGrowth = 0;
+      lastListCards = 0;
+      const adv = await sendToTabMsg(activeTabId, { type: 'LIST_ADVANCE' }, 25000);
+      const action = adv && adv.action;
+      if (action === 'clicked' || action === 'jumped') {
+        pushLog('ACTION', action === 'jumped' ? '列表翻页：URL跳页' : '列表翻页：点击下一页');
+        scheduleNextListTick(6000 + Math.random() * 7000); // 模拟人工翻页节奏
+      } else {
+        // 无按钮（SPA到底）或翻页原语不可用 → 本词真采尽
+        await handleExhausted();
+      }
+      return;
+    }
+    // 节奏：普通 0.9~2.5s；到底等懒加载窗口 6~10s（三轮 ≈ 18~30s 耐心，与旧版对齐）；
+    // 约3%长休 12~30s（风控拟人）
+    let delay = resp.atBottom ? 6000 + Math.random() * 4000 : 900 + Math.random() * 1600;
+    if (Math.random() < 0.03) {
+      delay = 12000 + Math.random() * 18000;
+      pushLog('SYS', '模拟真人阅读长休 ' + Math.round(delay / 1000) + 's');
+    }
+    scheduleNextListTick(delay);
+  } catch (e) {
+    pushLog('ERROR', '列表步进异常：' + String((e && e.stack) || e).slice(0, 400));
+    if (state.running && !enrichStop) scheduleNextListTick(4000); // 链路自愈
+  } finally {
+    listBusy = false;
+  }
+}
+
 chrome.alarms.onAlarm.addListener((alarm) => {
   if (alarm.name === ALARM_ENRICH) enrichTick();
+  else if (alarm.name === ALARM_LIST) listTick();
   else if (alarm.name === ALARM_HEARTBEAT) {
-    // 心跳兑底：闹钟链因任何原因断裂时，每分钟检查并重新拉起
-    if (!state.enrichScheduled || enrichStop || tickBusy) return;
+    // 心跳兑底：闹钟链因任何原因断裂时，每分钟检查并重新拉起（JD链 + 列表链）
+    if (tickBusy || listBusy) return;
+    if (enrichStop) return;
     chrome.alarms.getAll((all) => {
-      if (!all.some((a) => a.name === ALARM_ENRICH)) {
-        pushLog('SYS', '心跳检测到闹钟链断裂，已重新拉起');
+      const has = (n) => all.some((a) => a.name === n);
+      if (state.enrichScheduled && !has(ALARM_ENRICH)) {
+        pushLog('SYS', '心跳检测到JD补全闹钟链断裂，已重新拉起');
         scheduleNextTick(2000);
+      } else if (state.running && !state.enrichScheduled && !has(ALARM_LIST)) {
+        pushLog('SYS', '心跳检测到列表采集闹钟丢失，已重新拉起');
+        scheduleNextListTick(2000);
       }
     });
   }
@@ -720,6 +904,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       case 'START': {
         enrichStop = true; // 若旧采集在跑，立即停下（新调度启动时会重置）
         try { chrome.alarms.clear(ALARM_ENRICH); } catch (e) { /* ignore */ }
+        try { chrome.alarms.clear(ALARM_LIST); } catch (e) { /* ignore */ }
         state.target = msg.target || 100;
         state.enrich = msg.enrich !== false;
         state.collected = [];
@@ -739,6 +924,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           state.activeTabId = tab.id;
           await saveState();
           notifyTab(tab.id, 'START', 1000, 45);
+          enrichStop = false; // 重置停止标志，列表闹钟链才能拉起
+          scheduleNextListTick(2500); // 列表采集闹钟链启动（v1.5.0）
         } catch (e) {
           setStatus('ERROR', '打开页面失败：' + e.message);
           state.running = false;
@@ -750,27 +937,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
       case 'EXHAUSTED': {
         // 当前搜索词已无更多岗位：优先切换队列中的下一个搜索词
-        if (state.running && state.queueIndex + 1 < (state.queue || []).length) {
-          state.queueIndex++;
-          state.searchUrl = state.queue[state.queueIndex];
-          // 注意：状态用 SWITCH 而非 RUN，避免随后的 LOOP_END 误判为异常停止而中断接力
-          setStatus('SWITCH', `当前搜索词已采尽，自动切换下一搜索词（${state.queueIndex + 1}/${state.queue.length}）…`);
-          pushLog('ACTION', `搜索词采尽，接力切换 ${state.queueIndex + 1}/${state.queue.length}：${state.searchUrl}`);
-          await saveState();
-          try { await chrome.tabs.update(activeTabId, { url: state.searchUrl }); } catch (e) { /* ignore */ }
-          sendResponse({ ok: true, next: true });
-          break;
-        }
-        // 队列也空了：收尾并补全 JD
-        state.running = false;
-        const total = state.collected.length;
-        setStatus(
-          'DONE',
-          `全部搜索词采集完毕，共 ${total} 条（BOSS 单搜索词上限约300条，可增加关键词扩大范围）`
-        );
-        await saveState();
-        scheduleEnrich();
-        sendResponse({ ok: true, next: false });
+        // （v1.5.0：主链路改由 listTick 判定后调 handleExhausted；此消息仅为兼容兑底）
+        const next = await handleExhausted();
+        sendResponse({ ok: true, next });
         break;
       }
 
