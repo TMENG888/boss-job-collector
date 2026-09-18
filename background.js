@@ -355,8 +355,28 @@ async function tabTitle(tabId) {
 }
 
 // 导航热标签页到详情页并提取（完成后负责导航回列表页恢复现场）
+// 标签页丢失恢复：优先复用任意 zhipin 标签页，否则新开（不激活，后台进行）
+async function recoverTab() {
+  try {
+    const tabs = await chrome.tabs.query({ url: 'https://www.zhipin.com/*' });
+    if (tabs.length) {
+      activeTabId = tabs[0].id;
+      state.activeTabId = activeTabId;
+      await saveState();
+      pushLog('SYS', `已切换到现有 zhipin 标签页 #${activeTabId} 恢复采集`);
+      return activeTabId;
+    }
+  } catch (e) { /* ignore */ }
+  const tab = await chrome.tabs.create({ url: state.searchUrl || 'https://www.zhipin.com/', active: false });
+  activeTabId = tab.id;
+  state.activeTabId = activeTabId;
+  await saveState();
+  pushLog('SYS', `已新开标签页 #${activeTabId} 恢复采集`);
+  return activeTabId;
+}
+
 async function warmTabDetail(link) {
-  const tabId = activeTabId;
+  let tabId = activeTabId;
   if (tabId == null) return { jd: '', via: 'no-tab' };
   let listUrl = state.searchUrl;
   let winId = null;
@@ -374,7 +394,17 @@ async function warmTabDetail(link) {
   }
   const t0 = Date.now();
   try {
-    await chrome.tabs.update(tabId, { url: link });
+    try {
+      await chrome.tabs.update(tabId, { url: link });
+    } catch (e) {
+      // 标签页已丢失（被关闭/崩溃/被浏览器回收）：自动重建，否则整个队列会以
+      // “导航失败”级联烧穿（每条3次重试全部白耗且被误标完成）
+      const msg = String((e && e.message) || e);
+      if (!/No tab with id|tab was closed|cannot be edited|Tabs cannot/i.test(msg)) throw e;
+      pushLog('WARN', `任务标签页已丢失（${msg.slice(0, 60)}），自动重建恢复采集`);
+      tabId = await recoverTab();
+      await chrome.tabs.update(tabId, { url: link });
+    }
     // 安检链：security.html(JS算令牌)→重定向回 job_detail。等 URL 落位（最多25s）
     let landed = await waitTabUrl(tabId, (u) => /job_detail\//.test(u || ''), 25000);
     if (!landed) {
@@ -453,7 +483,6 @@ async function warmTabDetail(link) {
       diag: { src: 'tab', title: '导航失败', url: link, n: 0, text: String((e && e.message) || e).slice(0, 120) }
     };
   } finally {
-    // 无论成败都导航回列表页恢复现场（用户能继续看到列表）
     if (listUrl) {
       try { await chrome.tabs.update(tabId, { url: listUrl }); } catch (e) { /* ignore */ }
       await waitTabComplete(tabId, 15000);
@@ -479,6 +508,13 @@ function applyDetail(key, d) {
     sanitizeJob(j);
     j.detailVia = d.via || '';
     if (!d.jd && d.diag) j.detailDiag = d.diag; // 诊断：拿不到 JD 时记录页面指纹
+    if (d.via === 'fail') {
+      // 基础设施故障（标签页丢失/导航异常）：不消耗重试次数、不标记完成，
+      // 待恢复后自动重试；否则会级联把整个队列烧成“完成但无JD”
+      j.detailTries = Math.max(0, (j.detailTries || 1) - 1);
+      j.detailFetching = false;
+      continue;
+    }
     j.detailTries = (j.detailTries || 0) + 1;
     // 只有真抓到 JD 才算完成（空结果重试，最多 3 次）；必清 detailFetching 防死循环
     if (d.jd || j.detailTries >= 3) j.detailFetched = true;
@@ -497,8 +533,7 @@ const ALARM_HEARTBEAT = 'enrichHeartbeat';
 // 每日JD额度：默认 300 条/天，可在弹窗"每日JD上限"调整（0=不限制）。
 // 注意：300 并非实测阈值，而是保守推断值——真实日志显示单日~1000条本身
 // 未立刻封禁，但账号风险分疑似跨天累积（"多次违规"），额度用于控制累积速度
-let dailyCap = 300;
-try {
+let dailyCap = 300;try {
   chrome.storage.onChanged.addListener((changes, area) => {
     if (area === 'local' && changes.boss_settings) {
       const v = changes.boss_settings.newValue && changes.boss_settings.newValue.dailyCap;
@@ -511,6 +546,7 @@ try {
   }).catch(() => {});
 } catch (e) { /* ignore */ }
 let tickBusy = false;
+let infraFailStreak = 0; // 连续基础设施故障（导航失败）计数
 
 function scheduleNextTick(delayMs) {
   if (enrichStop) return;
@@ -574,6 +610,19 @@ async function enrichTick() {
     const d = await warmTabDetail(j.link);
     applyDetail(key, d);
     await saveState(); // 立即持久化：SW 在步间休眠也不丢结果（此前丢失导致同一岗位反复重抓）
+    // 连续基础设施故障熔断：重建标签页 + 暂停1分钟，避免 8s 间隔级联烧穿队列
+    if (d.via === 'fail') {
+      infraFailStreak++;
+      if (infraFailStreak >= 3) {
+        infraFailStreak = 0;
+        await recoverTab();
+        pausedUntil = Date.now() + 60000;
+        setStatus('WARN', '标签页连续异常，已自动重建并暂停1分钟后继续…');
+        pushLog('WARN', '连续3次导航失败：已重建标签页，熔断1分钟');
+      }
+    } else {
+      infraFailStreak = 0;
+    }
     const done = state.collected.length - pendingCount();
     const tag = d.jd
       ? ` · 上条 ${(d.ms / 1000).toFixed(1)}s · ${d.jdVia || ''}`
@@ -836,11 +885,20 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           }
           if (j.collectedAt && (!prev.collectedAt || j.collectedAt < prev.collectedAt)) prev.collectedAt = j.collectedAt;
         }
+        // 修复被“导航失败级联”误标完成的记录：无JD且最后状态是基础设施故障 → 重置待补
+        let repaired = 0;
+        for (const j of out) {
+          if (j.detailFetched && !j.jd && (j.detailVia === 'fail' || j.detailVia === 'no-tab')) {
+            j.detailFetched = false;
+            j.detailTries = 0;
+            repaired++;
+          }
+        }
         const removed = state.collected.length - out.length;
         state.collected = out;
         await saveState();
-        setStatus(status.status === 'DONE' ? 'DONE' : 'IDLE', `校验完成：合并 ${removed} 条重复、回填 ${filled} 个空字段`);
-        pushLog('ACTION', `校验修复：合并 ${removed} 条同键重复记录，回填 ${filled} 个空字段`);
+        setStatus(status.status === 'DONE' ? 'DONE' : 'IDLE', `校验完成：合并 ${removed} 条重复、回填 ${filled} 个空字段${repaired ? `、重置 ${repaired} 条误标记录` : ''}`);
+        pushLog('ACTION', `校验修复：合并 ${removed} 条同键重复记录，回填 ${filled} 个空字段${repaired ? `，重置 ${repaired} 条因标签页丢失被误标的记录` : ''}`);
         sendResponse({ ok: true, fixed: merged, ...snapshot() });
         break;
       }
