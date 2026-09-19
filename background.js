@@ -609,10 +609,20 @@ function applyDetail(p, key, d) {
     j.experience = j.experience || d.experience || '';
     const comp = parseCompanyRaw(d.companyRaw, j.company);
     if (!j.company && comp.name) j.company = comp.name;
-    j.industry = j.industry || comp.industry || '';
-    j.scale = j.scale || comp.scale || '';
-    j.funding = j.funding || comp.funding || '';
-    j.area = j.area || d.area || '';
+    // 实习僧详情 __NUXT__ 结构化值（公司侧栏懒渲染，DOM拿不到）：补齐行业/规模/融资/技能
+    j.industry = j.industry || comp.industry || d.industry || '';
+    j.scale = j.scale || comp.scale || d.scale || '';
+    j.funding = j.funding || comp.funding || d.funding || '';
+    if (!j.skills && d.skills) j.skills = d.skills;
+    if (p === 'sx' && d.area && d.area.indexOf('/') !== -1) {
+      // 详情工作地址 "广东省/广州市/天河区 街道…"：把列表仅有的市级升级为 市+区（对齐 BOSS 数据粒度）
+      const segs = String(d.area).split(/\s+/)[0].split('/');
+      const city = (segs[1] || '').replace(/市$/, '');
+      const dist = (segs[2] || '').trim();
+      if (city && dist && (!j.area || j.area.replace(/市$/, '') === city)) j.area = city + dist;
+    } else {
+      j.area = j.area || d.area || '';
+    }
     sanitizeJob(j);
     j.detailVia = d.via || '';
     if (!d.jd && d.diag) j.detailDiag = d.diag; // 诊断：拿不到 JD 时记录页面指纹

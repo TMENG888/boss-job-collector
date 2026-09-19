@@ -794,6 +794,36 @@
   /* ================= JD 详情获取 ================= */
   /* ================= 详情页字段提取 ================= */
   // 实习僧详情页：字段全部明文（快照验证），直接选择器命中；JD 多层降级同 BOSS
+  /* ====== 实习僧内联状态（window.__NUXT__）解析 ======
+   * 公司侧栏（规模/融资/行业）是客户端懒渲染：DOM 里只有空 Vue 注释占位，
+   * SSR 初始状态脚本里才有现成结构化值（实测快照：o.scale="150-500人"、
+   * o.stock_status="未融资"、o.industry="教育/培训"），直接从脚本文本正则提取 */
+  function sxNuxtText(root) {
+    try {
+      for (const s of root.querySelectorAll('script:not([src])')) {
+        const t = s.textContent || '';
+        if (t.indexOf('window.__NUXT__') !== -1) return t;
+      }
+    } catch (e) { /* ignore */ }
+    return '';
+  }
+  function sxNuxtStr(root, name) {
+    const t = sxNuxtText(root);
+    if (!t) return '';
+    const m = t.match(new RegExp('[.;,{]' + name + '=("((?:\\\\.|[^"\\\\])*)")'));
+    if (!m) return '';
+    try { return JSON.parse(m[1]); } catch (e) { return m[2]; } // JSON.parse 顺带解码 \uXXXX 转义
+  }
+  function sxNuxtArr(root, name) {
+    const t = sxNuxtText(root);
+    if (!t) return [];
+    const m = t.match(new RegExp('[.;,{]' + name + '=\\[([^\\]]*)\\]'));
+    if (!m) return [];
+    return [...m[1].matchAll(/"((?:\\.|[^"\\])*)"/g)]
+      .map((x) => { try { return JSON.parse('"' + x[1] + '"'); } catch (e) { return x[1]; } })
+      .filter(Boolean);
+  }
+
   function extractDetailSx(root) {
     const pick1 = (sels) => {
       for (const s of sels) {
@@ -821,6 +851,11 @@
       const scope = root.querySelector('.content_left .con-job');
       if (scope) jd = blockText(scope);
     });
+    layer('层3 NUXT状态', () => {
+      // __NUXT__ o.info = JD 全文（SSR 初始数据，换行完整保留）
+      const t = sxNuxtStr(root, 'info');
+      if (t) jd = t;
+    });
     layer('层3关键词', () => {
       const cands = [];
       for (const e of root.querySelectorAll('div,section')) {
@@ -844,12 +879,17 @@
     const cp = comPosEl ? String(comPosEl.textContent || '').replace(/\s+/g, ' ').trim() : '';
     const cpM = cp.match(/^(\S*)\s+(.+)$/);
     if (cpM) { area = cpM[1]; comFromPos = cpM[2]; }
-    const company = (pick1(SEL_SX_DETAIL.company) || {}).textContent
-      ? txt(pick1(SEL_SX_DETAIL.company))
-      : comFromPos;
+    const company = sxNuxtStr(root, 'cname')
+      || (() => { const el = pick1(SEL_SX_DETAIL.company); return el ? txt(el) : ''; })()
+      || comFromPos;
     const welfare = [...new Set(qsa(SEL_SX_DETAIL.welfare, root).map(txt).filter(Boolean))].join('、');
     const dateRaw = pick1(SEL_SX_DETAIL.date);
     const deadline = pick1(SEL_SX_DETAIL.deadline);
+    // 新增字段：__NUXT__ 结构化值（公司侧栏懒渲染拿不到，这里必取到）
+    const industry = sxNuxtStr(root, 'industry');
+    const scale = sxNuxtStr(root, 'scale');
+    const funding = sxNuxtStr(root, 'stock_status');
+    const skills = sxNuxtArr(root, 'skills').join('、');
     // 把额外信息收进 companyRaw（保留换行），供后台按 token 解析
     const raw = [
       company,
@@ -862,13 +902,22 @@
     return {
       jd: String(jd || '').slice(0, 5000),
       jdVia,
-      name: (() => { const el = pick1(SEL_SX_DETAIL.name); return el ? txt(el) : ''; })(),
-      salary: money ? txt(money) : '',
+      name: (() => {
+        const el = pick1(SEL_SX_DETAIL.name);
+        const dn = el ? txt(el) : '';
+        const nn = sxNuxtStr(root, 'iname');
+        return !dn || dn.includes('□') ? (nn || dn) : dn; // NUXT 明文修复加密岗位名
+      })(),
+      salary: sxNuxtStr(root, 'salary_desc') || (money ? txt(money) : ''),
       welfare,
       area,
-      education: eduEl ? txt(eduEl) : '',
+      education: eduEl ? txt(eduEl) : sxNuxtStr(root, 'degree'),
       experience: expEl ? txt(expEl) : '',
-      companyRaw: raw
+      companyRaw: raw,
+      industry,
+      scale,
+      funding,
+      skills
     };
   }
 
