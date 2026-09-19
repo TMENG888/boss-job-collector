@@ -1082,6 +1082,19 @@
           return { exhausted: true };
         }
       }
+      if (IS_SX) {
+        // 实习僧 = SSR 翻页列表（Element-UI 分页，20条/页）：卡片已全部渲染，
+        // 不做滚动加载；本页抓完直接依据分页控件判定（btn-next 可用=有下一页，
+        // 置灰=最后一页），不走 BOSS 无限滚动专用的"到底+3轮无增长"启发式
+        const added = await grabVisible();
+        const cards = findCards().length;
+        const btn = qsOne(SEL_SX.pagerNext);
+        if (!btn || btn.disabled || isDisabled(btn)) {
+          report('RUN', '已是最后一页（下一页按钮置灰），本搜索词采尽');
+          return { exhausted: true, cards, added, page: curPageNo() };
+        }
+        return { cards, added, atBottom: false, pageDone: true, page: curPageNo() };
+      }
       const scroller = findScrollContainer();
       await humanScrollOnce(scroller); // 拟人手势（含合成 scroll 派发唤醒懒加载器）
       const added = await grabVisible();

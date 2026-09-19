@@ -858,8 +858,23 @@ async function listTick(p) {
       return;
     }
     if (resp.exhausted) {
-      // 跳页守卫判定采尽
+      // 跳页守卫/最后一页（btn-next 置灰）判定采尽
       await handleExhausted(p);
+      return;
+    }
+    if (resp.pageDone) {
+      // 实习僧（SSR 翻页）：本页已抓完 → 立即翻页。
+      // 关键：跳页时页面卸载会吞掉应答（gone/timeout），但跳页指令在卸载前
+      // 已执行，落地由 ensureInit 守卫校验（页码/首卡内容比对），
+      // 因此应答丢失 ≠ 失败——若误判失败会提前切下一搜索词（v2.0.2 及以前的真实 bug）
+      const adv = await sendToTabMsg(t.activeTabId, { type: 'LIST_ADVANCE' }, 8000);
+      const action = adv && adv.action;
+      if (action === 'jumped' || action === 'clicked' || !action) {
+        pushLog('ACTION', `[${PLAT[p].name}] 第 ${resp.page || '?'} 页采集完成，翻页加载下一页`);
+        scheduleNextListTick(p, 7000 + Math.random() * 5000); // 等新页加载 + 拟人翻页节奏
+      } else {
+        await handleExhausted(p);
+      }
       return;
     }
     if (resp.blocked) {
