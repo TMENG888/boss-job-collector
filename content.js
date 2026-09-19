@@ -14,6 +14,15 @@
   if (window.__BOSS_COLLECTOR__) return;
   window.__BOSS_COLLECTOR__ = true;
 
+  /* ================= 平台检测 =================
+   * 同一份 content.js 跑在两个站点上：
+   *  - boss：BOSS直聘（无限滚动 SPA + 详情页安检跳转 + 薪资字体加密）
+   *  - sx  ：实习僧（MPA 分页 20条/页 + 列表页薪资/天数/月数/规模字体加密，
+   *          详情页字段明文，无需解密）
+   */
+  const PLATFORM = /(^|\.)shixiseng\.com$/.test(location.hostname) ? 'sx' : 'boss';
+  const IS_SX = PLATFORM === 'sx';
+
   /* ================= 可配置参数 ================= */
   const CONFIG = {
     pageDelay: [6000, 13000],   // 翻页之间随机停留区间（毫秒）。过快会触发 IP 风控
@@ -53,6 +62,41 @@
       '.company-box ul li'
     ],
     next: ['a[ka="page-next"]', '[ka="page-next"]', '.page-next', '.ui-icon-arrow-page-next']
+  };
+
+  /* ====== 实习僧选择器（基于真实页面快照验证，见 CHANGELOG v2.0.0）======
+   * 列表卡片：div.intern-item[data-intern-id="inn_xxx"]，每页20条，
+   * Element-UI 标准分页（el-pagination）+ ?page=N URL 跳页。
+   * 加密字体元素带 .font 类（字体 myFont，/interns/iconfonts/file?rand= 动态加载），
+   * 详情页字段全部明文，无需解密。
+   */
+  const SEL_SX = {
+    card: ['div.intern-item[data-intern-id]', '.intern-wrap.intern-item'],
+    jobLink: ['a.title[href*="/intern/"]', 'a[href*="/intern/"]'],
+    salary: ['.day.font', '.day'],
+    city: ['.city.ellipsis', '.city'],
+    tipFonts: ['.intern-detail__job .tip .font'],
+    company: ['.intern-detail__company a.title'],
+    companyTip: ['.intern-detail__company .tip span'],
+    welfare: ['.intern-label'],
+    pagerNext: ['.el-pagination .btn-next'],
+    pager: ['.el-pagination .el-pager']
+  };
+
+  /* ====== 实习僧详情页选择器（字段均为明文）====== */
+  const SEL_SX_DETAIL = {
+    name: ['.new_job_name'],
+    jd: ['.job_detail'],
+    salary: ['.job_money'],
+    area: ['.job_position'],
+    education: ['.job_academic'],
+    week: ['.job_week'],
+    experience: ['.job_time'],       // 实习3个月
+    date: ['.job_date'],
+    welfare: ['.job_good_list span'],
+    comPosition: ['.com_position'],  // 湖北省/武汉市/武昌区 公司名
+    company: ['.com-name'],
+    deadline: ['.con-job .cutom_font'] // 截止日期：20XX-XX-XX
   };
 
   /* ====== 详情页选择器（fetch / iframe 两种方式共用） ====== */
@@ -333,7 +377,7 @@
       return null;
     }
 
-    async function init(salaryEl) {
+    async function init(salaryEl, sampleSel) {
       if (ready) return ready;
       ready = (async () => {
         try {
@@ -349,9 +393,9 @@
           } catch (e) { /* ignore */ }
           document.fonts.forEach((f) => pushFam(f.family));
 
-          // 2) 采样 PUA 加密字符
+          // 2) 采样 PUA 加密字符（采样范围按平台传入：BOSS=薪资元素，实习僧=列表内 .font 元素）
           const samples = [];
-          const els = salaryEl ? [salaryEl] : Array.from(document.querySelectorAll('.salary, .job-salary')).slice(0, 6);
+          const els = salaryEl ? [salaryEl] : Array.from(document.querySelectorAll(sampleSel || '.salary, .job-salary')).slice(0, 6);
           for (const el of els) {
             const m = (el.textContent || '').match(/[\uE000-\uF8FF]/g);
             if (m) samples.push(...m.slice(0, 10));
@@ -412,11 +456,51 @@
 
   /* ================= 解析岗位卡片 ================= */
   function findCards() {
-    let cards = qsa(SEL.card);
+    let cards = qsa(IS_SX ? SEL_SX.card : SEL.card);
     if (cards.length > 1) {
       cards = cards.filter((c) => !cards.some((o) => o !== c && c.contains(o)));
     }
     return cards;
+  }
+
+  // 实习僧列表卡片解析（选择器/字段结构均经真实页面快照验证）
+  // 注意：名称/薪资/天数/月数/规模可能含加密字形（_pua 字段标记），
+  // 解密在 parseCardAsync 中完成后才提取经验/规模，否则正则匹配不到数字
+  function parseCardSx(card) {
+    try {
+      const id = card.getAttribute('data-intern-id') || '';
+      const a = qsOne(SEL_SX.jobLink, card) || card.querySelector('a[href]');
+      let link = '';
+      if (a) {
+        try { link = new URL(a.getAttribute('href'), location.origin).href; } catch (e) { /* ignore */ }
+      }
+      if (!link && id) link = `${location.origin}/intern/${id}`;
+      // 优先 textContent（text 节点实体已被解析器解码为真实 PUA 字符）；
+      // title 属性在源码中被双重转义，取到的是 "&#xf040" 形式的字面文本，无法解密
+      const nameEl = card.querySelector('a.title');
+      const name = (nameEl && txt(nameEl)) || (nameEl ? nameEl.getAttribute('title') : '') || '';
+      const salary = txt(qsOne(SEL_SX.salary, card));          // 加密数字 + /天
+      const city = txt(qsOne(SEL_SX.city, card));
+      // tip 行加密字体：['X天/周', 'Y个月']（数字为 PUA，待解密）
+      const tipFonts = qsa(SEL_SX.tipFonts, card).map(txt);
+      const companyEl = qsOne(SEL_SX.company, card);
+      const company = companyEl ? companyEl.getAttribute('title') || txt(companyEl) : '';
+      const compSpans = qsa(SEL_SX.companyTip, card).map(txt).filter((s) => s && s !== '/');
+      const industry = compSpans.find((s) => /\//.test(s)) || '';
+      const scale = compSpans.find((s) => /人/.test(s)) || '';
+      const welfare = qsa(SEL_SX.welfare, card)
+        .map((x) => x.getAttribute('title') || txt(x))
+        .filter(Boolean)
+        .join('、');
+      return {
+        name, salary, area: city, experience: '', education: '', skills: '',
+        welfare, company, industry, scale, funding: '',
+        link, platform: 'sx',
+        _sxTipFonts: tipFonts // 私有字段：解密后提取实习时长，入库前删除
+      };
+    } catch (e) {
+      return null;
+    }
   }
 
   function parseCard(card) {
@@ -469,16 +553,31 @@
 
   let decodeWarned = false;
   async function parseCardAsync(card) {
-    const j = parseCard(card);
+    const j = IS_SX ? parseCardSx(card) : parseCard(card);
     if (!j) return null;
-    if (FontDecoder.isPUA(j.salary)) {
-      // 传入真实薪资元素：用它的计算字体定位加密字体，比盲猜可靠得多
-      const ok = await FontDecoder.init(qsOne(SEL.salary, card));
+    // 实习僧列表页的名称/薪资/天数/月数/规模都可能含加密字形；详情页为明文，
+    // JD 补全时会用明文覆盖，这里的解密只是提前可用
+    if (FontDecoder.isPUA(j.salary) || FontDecoder.isPUA(j.name) || (j._sxTipFonts || []).some(FontDecoder.isPUA)) {
+      const ok = await FontDecoder.init(
+        IS_SX ? qsOne(SEL_SX.salary, card) : qsOne(SEL.salary, card),
+        IS_SX ? '.intern-item .font' : null
+      );
       j.salary = FontDecoder.decodeText(j.salary); // 解密不可用时以□占位，避免隐形乱码
+      j.name = FontDecoder.decodeText(j.name);
+      j.scale = FontDecoder.decodeText(j.scale);
+      if (j._sxTipFonts) {
+        // 解密后再提取实习时长（PUA 字形不是 \d，解密前正则匹配不到数字）
+        const fonts = j._sxTipFonts.map(FontDecoder.decodeText);
+        const months = (fonts.find((s) => /个月/.test(s)) || '').match(/(\d+)\s*个月/);
+        if (months) j.experience = `实习${months[1]}个月`;
+        delete j._sxTipFonts;
+      }
       if (!ok && !decodeWarned) {
         decodeWarned = true;
-        report('WARN', '薪资含加密字符且自动解密未成功，对应数字将以□显示');
+        report('WARN', '部分数字为加密字体且自动解密未成功，对应数字将以□显示（JD补全后会被详情页明文覆盖）');
       }
+    } else if (j._sxTipFonts) {
+      delete j._sxTipFonts;
     }
     return j;
   }
@@ -583,7 +682,32 @@
     }
   }
 
+  // 实习僧翻页：URL 跳页为主（SSR MPA，与手点同效）；btn-next 置灰 = 最后一页
+  async function gotoNextPageSx() {
+    const btn = qsOne(SEL_SX.pagerNext);
+    if (btn && btn.disabled) {
+      report('RUN', '已是最后一页，本搜索词采尽');
+      return false;
+    }
+    if (!btn && !qsOne(SEL_SX.pager)) {
+      // 页面无分页控件（异常/无结果页）：交由后台处理
+      return false;
+    }
+    const before = firstCardKey();
+    const next = curPageNo() + 1;
+    try {
+      sessionStorage.setItem('__boss_prev_first', before || '');
+      sessionStorage.setItem('__boss_next_page', String(next));
+      const u = new URL(location.href);
+      u.searchParams.set('page', String(next));
+      location.href = u.toString();
+      await sleep(3000); // 导航生效则页面卸载，走不到这里
+    } catch (e) { /* ignore */ }
+    return false;
+  }
+
   async function gotoNextPage() {
+    if (IS_SX) return gotoNextPageSx();
     const before = firstCardKey();
     const btn = findNextButton();
 
@@ -632,7 +756,87 @@
 
   /* ================= JD 详情获取 ================= */
   /* ================= 详情页字段提取 ================= */
+  // 实习僧详情页：字段全部明文（快照验证），直接选择器命中；JD 多层降级同 BOSS
+  function extractDetailSx(root) {
+    const pick1 = (sels) => {
+      for (const s of sels) {
+        const el = root.querySelector(s);
+        if (el && txt(el)) return el;
+      }
+      return null;
+    };
+    // JD 多层降级（与 BOSS 同架构，选择器换成实习僧）
+    let jd = '';
+    let jdVia = '';
+    const valid = (t) => t && t.length >= 50;
+    const layer = (name, fn) => {
+      if (valid(jd)) return;
+      try {
+        fn();
+        if (valid(jd)) jdVia = name;
+      } catch (e) { /* ignore */ }
+    };
+    layer('层1选择器', () => {
+      const el = pick1(SEL_SX_DETAIL.jd);
+      if (el) jd = blockText(el);
+    });
+    layer('层2容器拼接', () => {
+      const scope = root.querySelector('.content_left .con-job');
+      if (scope) jd = blockText(scope);
+    });
+    layer('层3关键词', () => {
+      const cands = [];
+      for (const e of root.querySelectorAll('div,section')) {
+        const t = e.textContent || '';
+        if (t.length < 60 || t.length > 6000) continue;
+        const hits = (t.match(/岗位职责|工作职责|职位描述|任职要求|工作内容|任职资格|岗位要求|职责|工作要求/g) || []).length;
+        if (hits) cands.push({ e, t, hits });
+      }
+      cands.sort((a, b) => (b.hits - a.hits) || (a.t.length - b.t.length));
+      if (cands.length) jd = blockText(cands[0].e);
+    });
+
+    const money = pick1(SEL_SX_DETAIL.salary);
+    const eduEl = pick1(SEL_SX_DETAIL.education);
+    const expEl = pick1(SEL_SX_DETAIL.experience);   // 实习3个月
+    const weekEl = pick1(SEL_SX_DETAIL.week);        // 5天／周
+    const comPosEl = pick1(SEL_SX_DETAIL.comPosition);
+    // com_position 文本 = "湖北省/武汉市/武昌区 公司名（多 token）"：首 token（含/）为地区，其余为公司名
+    let area = '';
+    let comFromPos = '';
+    const cp = comPosEl ? String(comPosEl.textContent || '').replace(/\s+/g, ' ').trim() : '';
+    const cpM = cp.match(/^(\S*)\s+(.+)$/);
+    if (cpM) { area = cpM[1]; comFromPos = cpM[2]; }
+    const company = (pick1(SEL_SX_DETAIL.company) || {}).textContent
+      ? txt(pick1(SEL_SX_DETAIL.company))
+      : comFromPos;
+    const welfare = [...new Set(qsa(SEL_SX_DETAIL.welfare, root).map(txt).filter(Boolean))].join('、');
+    const dateRaw = pick1(SEL_SX_DETAIL.date);
+    const deadline = pick1(SEL_SX_DETAIL.deadline);
+    // 把额外信息收进 companyRaw（保留换行），供后台按 token 解析
+    const raw = [
+      company,
+      eduEl ? '学历要求 ' + txt(eduEl) : '',
+      expEl ? txt(expEl) : '',
+      weekEl ? txt(weekEl) : '',
+      deadline ? txt(deadline) : '',
+      dateRaw ? '发布于 ' + txt(dateRaw) : ''
+    ].filter(Boolean).join('\n');
+    return {
+      jd: String(jd || '').slice(0, 5000),
+      jdVia,
+      name: (() => { const el = pick1(SEL_SX_DETAIL.name); return el ? txt(el) : ''; })(),
+      salary: money ? txt(money) : '',
+      welfare,
+      area,
+      education: eduEl ? txt(eduEl) : '',
+      experience: expEl ? txt(expEl) : '',
+      companyRaw: raw
+    };
+  }
+
   function extractDetail(doc) {
+    if (IS_SX) return extractDetailSx(doc.documentElement || doc);
     const root = doc.documentElement || doc;
     const pick = (sels) => {
       for (const s of sels) {
@@ -744,7 +948,7 @@
       // IP 级封禁页检测：标题仍是"BOSS直聘"，只能看正文特征。
       // 必须立即上报停止重试——封禁期间继续请求只会延长封禁
       const bodyNow = (document.body && document.body.innerText) || '';
-      if (/访问受限|IP\s*存在异常|暂时被禁止访问/.test(bodyNow)) {
+      if (/访问受限|IP\s*存在异常|暂时被禁止访问|访问异常|请求过于频繁/.test(bodyNow)) {
         const diag = {
           src: 'tab', title: '访问受限(IP风控)', url: location.href,
           n: bodyNow.length, text: bodyNow.replace(/\s+/g, ' ').slice(0, 120)
@@ -831,7 +1035,9 @@
   function firstCardKey() {
     const cards = findCards();
     if (!cards.length) return '';
-    const a = cards[0].querySelector('a[href*="/job_detail/"]');
+    const a = cards[0].querySelector(
+      IS_SX ? 'a[href*="/intern/"]' : 'a[href*="/job_detail/"]'
+    );
     return a ? a.getAttribute('href') : '';
   }
 
@@ -925,7 +1131,7 @@
 
   // 页面加载后：若后台任务正在进行且本标签页就是任务页，则自动继续（应对中途刷新/跳转）
   try {
-    chrome.runtime.sendMessage({ type: 'IS_RUNNING' }, (resp) => {
+    chrome.runtime.sendMessage({ type: 'IS_RUNNING', platform: PLATFORM }, (resp) => {
       if (resp && resp.running) startRunning();
     });
   } catch (e) { /* ignore */

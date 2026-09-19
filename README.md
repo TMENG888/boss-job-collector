@@ -1,11 +1,12 @@
-# BOSS岗位采集助手 (boss-job-collector)
+# 岗位采集助手 (boss-job-collector)
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![Chrome](https://img.shields.io/badge/Chrome-Manifest%20V3-4285F4)](https://developer.chrome.com/docs/extensions/)
-[![Platform](https://img.shields.io/badge/平台-BOSS直聘-00bebc)](https://www.zhipin.com)
+[![Platform](https://img.shields.io/badge/平台-BOSS直聘_|_实习僧-00bebc)](https://www.zhipin.com)
 
-一个开源的 Chrome 扩展（Manifest V3），用于自动采集 BOSS 直聘搜索结果中的岗位数据：
+一个开源的 Chrome 扩展（Manifest V3），用于自动采集 **BOSS 直聘** 与 **实习僧** 搜索结果中的岗位数据：
 逐屏增量采集、自动翻页、多关键词接力、薪资字体加密自动解密、JD 详情抓取，达到设定数量自动停止，一键导出 CSV。
+**两平台可同时各自运行采集任务，互不干扰。**
 
 > **⚠️ 免责声明**：本项目仅供个人求职与学习研究使用。使用前请阅读并遵守 BOSS 直聘《用户协议》；请控制采集频率与数量，请勿商用、勿转卖数据、勿用于任何违法违规用途。因使用本工具产生的一切后果由使用者自行承担，与作者无关。
 
@@ -45,8 +46,11 @@
 
 ## 工作原理
 
-- **不碰加密 API**：BOSS 接口有 `zp_token` 等签名校验，插件改为解析浏览器渲染好的 DOM，行为上最接近真人
-- **薪资字体解密**：定位加密字体优先读取薪资元素的计算字体 + `fonts.check` 验证码位覆盖；把加密字形画到 canvas 与参考模板（系统字体 + 自定义字体自带 ASCII 字形）做相似度匹配；用未分配码位生成豆腐块基准过滤缺字假模板；解密失败以 `□` 显式占位
+- **双平台并行**：支持 BOSS直聘（zhipin.com）与实习僧（shixiseng.com），两平台可
+  同时各自运行完整任务链（列表采集→JD补全），状态/闹钟/风控节奏/每日额度互不干扰；
+  弹窗顶部切换平台，CSV 带"平台"列按平台独立导出
+- **不碰加密 API**：BOSS/实习僧接口均有签名校验，插件改为解析浏览器渲染好的 DOM，行为上最接近真人
+- **薪资字体解密**：定位加密字体优先读取薪资元素的计算字体 + `fonts.check` 验证码位覆盖；把加密字形画到 canvas 与参考模板（系统字体 + 自定义字体自带 ASCII 字形）做相似度匹配；用未分配码位生成豆腐块基准过滤缺字假模板；解密失败以 `□` 显式占位。实习僧列表页同用此引擎；实习僧详情页字段为明文，JD 补全时自动覆盖加密值
 - **列表采集（闹钟驱动单步）**：滚动采集不在页面内自转，而是后台闹钟每步发一次
   "手势+抓取"指令——Service Worker 随便休眠、浏览器最小化、标签页隐藏都不会中断。
   这是实测修正：隐藏标签页中页面内定时器被 Chrome 节流到 ~1次/分且 scroll 事件
@@ -63,20 +67,22 @@
 
 ```
 boss-job-collector/
-├── manifest.json    # MV3 配置（权限最小化：storage + downloads + scripting）
-├── content.js       # 页面解析 / 滚动翻页 / 字体解密 / 详情页内提取
-├── background.js    # 任务调度 / 队列接力 / 热标签页JD导航 / 抗中断恢复 / 持久化
-├── popup.html/js    # 参数配置 / 进度展示 / CSV 导出
+├── manifest.json    # MV3 配置（权限最小化：storage + downloads + scripting + alarms）
+├── content.js       # 双平台页面解析 / 滚动翻页 / 字体解密 / 详情页内提取
+├── background.js    # 双平台任务分桶 / 队列接力 / 热标签页JD导航 / 抗中断恢复 / 持久化
+├── popup.html/js    # 平台切换 / 参数配置 / 进度展示 / CSV 导出
+├── log.html/js      # 当日运行日志查看
 ├── LICENSE          # MIT
 └── CHANGELOG.md     # 更新日志
 ```
 
 ## 二次开发
 
-BOSS 会不定期改版，如采集失败按以下入口排查：
+BOSS/实习僧会不定期改版，如采集失败按以下入口排查：
 
-- **列表选择器失效**：改 `content.js` 顶部 `SEL` 对象（每个字段支持多个备选选择器，按顺序尝试）
-- **详情页选择器失效**：改 `content.js` 的 `SEL_DETAIL`
+- **BOSS 列表选择器失效**：改 `content.js` 顶部 `SEL` 对象（每个字段支持多个备选选择器，按顺序尝试）
+- **实习僧列表/详情选择器失效**：改 `content.js` 的 `SEL_SX` / `SEL_SX_DETAIL`
+- **BOSS 详情页选择器失效**：改 `content.js` 的 `SEL_DETAIL`
 - **字体解密阈值**：改 `content.js` 中 `FontDecoder` 的 `0.55 / 0.7` 相似度阈值
 - **采集节奏**：改 `content.js` 顶部 `CONFIG`（翻页延时、滚动步进、超时等）
 

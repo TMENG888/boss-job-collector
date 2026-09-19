@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "BOSS岗位采集助手",
-  "version": "1.5.0",
-  "description": "开源岗位采集工具：逐屏增量采集、自动翻页、多关键词接力、薪资字体解密、JD详情抓取，达到设定数量自动停止。仅供个人求职与学习研究使用。",
+  "version": "2.0.0",
+  "description": "开源岗位采集工具（支持 BOSS直聘 + 实习僧 双平台并行）：逐屏增量采集、自动翻页、多关键词接力、薪资字体解密、JD详情抓取，达到设定数量自动停止。仅供个人求职与学习研究使用。",
   "homepage_url": "https://github.com/TMENG888/boss-job-collector",
   "permissions": ["storage", "downloads", "scripting", "alarms"],
-  "host_permissions": ["https://www.zhipin.com/*"],
+  "host_permissions": ["https://www.zhipin.com/*", "https://www.shixiseng.com/*"],
   "background": {
     "service_worker": "background.js"
   },
@@ -15,10 +15,16 @@
       "js": ["content.js"],
       "run_at": "document_idle",
       "all_frames": false
+    },
+    {
+      "matches": ["https://www.shixiseng.com/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle",
+      "all_frames": false
     }
   ],
   "action": {
     "default_popup": "popup.html",
-    "default_title": "BOSS岗位采集助手"
+    "default_title": "岗位采集助手（BOSS直聘/实习僧）"
   }
 }

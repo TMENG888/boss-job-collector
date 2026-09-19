@@ -4,13 +4,24 @@
 <meta charset="UTF-8">
 <style>
   body {
-    width: 340px;
+    width: 360px;
     margin: 0;
     padding: 14px;
     font: 13px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
     color: #26292e;
   }
-  h1 { font-size: 15px; margin: 0 0 12px; }
+  h1 { font-size: 15px; margin: 0 0 10px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 12px; }
+  .tabs button {
+    flex: 1; padding: 7px 0; border: 1px solid #e2e4ea; background: #f6f7f9;
+    color: #6b7280; border-radius: 8px; font-size: 13px; cursor: pointer; position: relative;
+  }
+  .tabs button.active { background: #00bebc; border-color: #00bebc; color: #fff; font-weight: 600; }
+  .tabs .badge {
+    display: inline-block; min-width: 18px; margin-left: 5px; padding: 0 4px;
+    border-radius: 9px; background: #e5e6eb; color: #555; font-size: 11px; font-weight: 400;
+  }
+  .tabs button.active .badge { background: rgba(255,255,255,.25); color: #fff; }
   .row { margin-bottom: 10px; }
   label { display: block; color: #6b7280; margin-bottom: 3px; font-size: 12px; }
   input[type="text"], input[type="number"], select {
@@ -21,7 +32,7 @@
   .grid { display: flex; gap: 8px; }
   .grid > div { flex: 1; }
   .hint { color: #9aa0aa; font-size: 11px; margin-top: 3px; }
-  button {
+  button.op {
     width: 100%; padding: 8px 0; border: none; border-radius: 6px;
     font-size: 13px; cursor: pointer;
   }
@@ -39,19 +50,25 @@
   .bar i { display: block; height: 100%; background: #00bebc; width: 0; transition: width .3s; }
   .status { color: #8a919f; font-size: 12px; min-height: 18px; word-break: break-all; }
   .tips { color: #9aa0aa; font-size: 11px; margin-top: 10px; line-height: 1.55; }
+  .shared { margin-top: 10px; padding-top: 8px; border-top: 1px dashed #e5e6eb; }
 </style>
 </head>
 <body>
-  <h1>📋 BOSS岗位采集助手</h1>
+  <h1>📋 岗位采集助手</h1>
+
+  <div class="tabs">
+    <button id="tabBoss" class="active">BOSS直聘<span class="badge" id="cntBoss">0</span></button>
+    <button id="tabSx">实习僧<span class="badge" id="cntSx">0</span></button>
+  </div>
 
   <div class="row">
-    <label>岗位关键词（多个用逗号分隔，采完一个自动接力下一个）</label>
-    <input type="text" id="keyword" placeholder="如：爬虫实习生, python实习">
+    <label id="kwLabel">岗位关键词（多个用逗号分隔，采完一个自动接力下一个）</label>
+    <input type="text" id="keyword" placeholder="如：智能体开发, RPA实习">
   </div>
 
   <div class="row grid">
     <div>
-      <label>城市（留空=全国）</label>
+      <label id="cityLabel">城市（留空=全国）</label>
       <input type="text" id="city" placeholder="如：广州">
     </div>
     <div>
@@ -66,27 +83,32 @@
 
   <div class="row checkbox-row">
     <input type="checkbox" id="useCurrent">
-    <label for="useCurrent">采集当前已打开的搜索页（忽略上方设置）</label>
+    <label for="useCurrent" id="useCurrentLabel">采集当前已打开的搜索页（忽略上方设置）</label>
   </div>
   <div class="row checkbox-row">
     <input type="checkbox" id="enrichCheck" checked>
     <label for="enrichCheck">采集后自动获取JD职位详情</label>
   </div>
 
-  <button class="btn-start" id="startBtn">开始采集</button>
+  <button class="op btn-start" id="startBtn">开始采集</button>
   <div class="btn-row">
-    <button class="btn-stop" id="stopBtn">停止</button>
-    <button class="btn-ghost" id="exportBtn">导出CSV</button>
-    <button class="btn-ghost" id="jdBtn">补全JD</button>
-    <button class="btn-ghost" id="sanitizeBtn">校验修复</button>
-    <button class="btn-ghost" id="clearBtn">清空</button>
-    <button class="btn-ghost" id="logBtn" title="打开当日运行日志（跨天自动清空）">查看日志</button>
+    <button class="op btn-stop" id="stopBtn">停止</button>
+    <button class="op btn-ghost" id="exportBtn">导出CSV</button>
+    <button class="op btn-ghost" id="jdBtn">补全JD</button>
+    <button class="op btn-ghost" id="sanitizeBtn">校验修复</button>
+    <button class="op btn-ghost" id="clearBtn">清空</button>
+    <button class="op btn-ghost" id="logBtn" title="打开当日运行日志（跨天自动清空）">查看日志</button>
   </div>
 
   <div class="progress">
     <div><span class="num" id="count">0</span> / <span id="targetShow">100</span> 条</div>
     <div class="bar"><i id="barFill"></i></div>
     <div class="status" id="status">空闲</div>
+  </div>
+
+  <div class="tips">
+    两个平台可同时各自运行采集任务，互不干扰；JD详情按平台独立补全。<br>
+    实习僧：详情页字段为明文，JD补全会顺带用明文覆盖列表页加密数字。
   </div>
 
   <script src="popup.js"></script>
