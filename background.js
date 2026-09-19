@@ -48,9 +48,7 @@ function defaultTask() {
     queueIndex: 0,
     enrichScheduled: false,
     activeTabId: null,
-    concurrency: 1,
-    dailyCount: 0,       // 每日JD额度计数（按平台独立计）
-    dailyDate: ''
+    concurrency: 1
   };
 }
 
@@ -429,16 +427,45 @@ async function tabTitle(tabId) {
   }
 }
 
-// 标签页丢失恢复：优先复用同平台任意标签页，否则新开（不激活，后台进行）
+// 探测标签页内容脚本是否可达：扩展重载后，旧页面上已注入的脚本会全部失效
+// （"Receiving end does not exist"），必须重载页面才能重新注入
+function pingTab(tabId, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    try {
+      chrome.tabs.sendMessage(tabId, { type: 'PING' }, () => {
+        if (done) return;
+        finish(!chrome.runtime.lastError);
+      });
+    } catch (e) { finish(false); }
+  });
+}
+
+// 标签页丢失恢复：优先复用同平台"内容脚本可达"的标签页；
+// 页面在但脚本不可达（扩展重载后的孤儿页）→ 重载重注入；都没有才新开（不激活，后台进行）
 async function recoverTab(p) {
   const t = T(p);
   try {
     const tabs = await chrome.tabs.query({ url: PLAT[p].tabQuery });
     if (tabs.length) {
-      t.activeTabId = tabs[0].id;
+      for (const cand of tabs) {
+        if (await pingTab(cand.id, 1200)) {
+          t.activeTabId = cand.id;
+          await saveState();
+          pushLog('SYS', `[${PLAT[p].name}] 已切换到现有标签页 #${cand.id} 恢复采集`);
+          return cand.id;
+        }
+      }
+      // 有页面但全部不可达：重载第一个（重载会重新注入内容脚本）
+      const id = tabs[0].id;
+      pushLog('SYS', `[${PLAT[p].name}] 现有标签页 #${id} 内容脚本不可达（多为扩展刚重载），重载重注入…`);
+      try { await chrome.tabs.reload(id); } catch (e) { /* ignore */ }
+      await waitTabComplete(id, 20000);
+      t.activeTabId = id;
       await saveState();
-      pushLog('SYS', `[${PLAT[p].name}] 已切换到现有标签页 #${t.activeTabId} 恢复采集`);
-      return t.activeTabId;
+      return id;
     }
   } catch (e) { /* ignore */ }
   const tab = await chrome.tabs.create({ url: t.searchUrl || PLAT[p].homeUrl, active: false });
@@ -484,7 +511,8 @@ async function warmTabDetail(link, p) {
     let landed = await waitTabUrl(tabId, (u) => PLAT[p].detailRe.test(u || ''), 25000);
     if (!landed) {
       // 未落位：区分"IP封禁页(403)"与"滑块/验证页"。封禁页标题可能是正常站点名，
-      // 只能读正文判断；封禁时继续等待/重试毫无意义，还会延长封禁
+      // 只能读正文判断；封禁时继续等待/重试毫无意义，还会延长封禁。
+      // 正文片段始终带回诊断（用户日志里能直接看出页面上写了什么）
       let bodyText = '';
       try {
         const res = await chrome.scripting.executeScript({
@@ -493,14 +521,15 @@ async function warmTabDetail(link, p) {
         });
         bodyText = (res && res[0] && res[0].result) || '';
       } catch (e) { /* ignore */ }
+      const bodySnippet = bodyText.replace(/\s+/g, ' ').trim().slice(0, 100);
       if (/访问受限|暂时被禁止|异常行为|访问异常|请求过于频繁/.test(bodyText)) {
         return {
           jd: '', via: 'blocked', ms: Date.now() - t0,
-          diag: { src: 'tab', title: await tabTitle(tabId), url: link, n: bodyText.length, text: 'IP/账号封禁页(访问受限)：等待解除，请勿频繁重试' }
+          diag: { src: 'tab', title: await tabTitle(tabId), url: link, n: bodyText.length, text: 'IP/账号封禁页(访问受限)·正文：' + (bodySnippet || '空') }
         };
       }
       const title = await tabTitle(tabId);
-      if (/安全验证|验证码|请稍候|security/i.test(title)) {
+      if (/安全验证|验证码|请稍候|security/i.test(title) || /拖动滑块|滑块|完成拼图|安全验证/.test(bodyText)) {
         setStatus(p, 'WARN', '页面出现安全验证，请在当前标签页手动完成（滑块/点选），完成后自动继续…');
         landed = await waitTabUrl(tabId, (u) => PLAT[p].detailRe.test(u || ''), 120000);
       }
@@ -602,25 +631,6 @@ function applyDetail(p, key, d) {
   return list[0];
 }
 
-/* ================= 每日JD额度 ================= */
-// 默认 300 条/天/平台，可在弹窗"每日JD上限"调整（0=不限制）。
-// 注意：300 并非实测阈值，而是保守推断值——真实日志显示 BOSS 单日约1000条
-// 本身未立刻封禁，但账号风险分疑似跨天累积（"多次违规"），额度用于控制累积速度。
-// 两个平台各计各的（风控体系互相独立）
-let dailyCap = 300;
-try {
-  chrome.storage.onChanged.addListener((changes, area) => {
-    if (area === 'local' && changes.boss_settings) {
-      const v = changes.boss_settings.newValue && changes.boss_settings.newValue.dailyCap;
-      dailyCap = v == null ? 300 : Math.max(0, parseInt(v, 10) || 0);
-    }
-  });
-  chrome.storage.local.get('boss_settings').then((d) => {
-    const v = d && d.boss_settings && d.boss_settings.dailyCap;
-    if (v != null) dailyCap = Math.max(0, parseInt(v, 10) || 0);
-  }).catch(() => {});
-} catch (e) { /* ignore */ }
-
 function scheduleNextTick(p, delayMs) {
   const r = rt(p);
   if (r.enrichStop) return;
@@ -648,22 +658,6 @@ async function enrichTick(p) {
   try {
     if (Date.now() < r.pausedUntil) {
       scheduleNextTick(p, r.pausedUntil - Date.now() + 1000); // 熔断冷却中，等解除
-      return;
-    }
-    // 每日额度熔断：跨天自动重置；用完后休眠到次日08:00
-    const today = new Date().toDateString();
-    if (t.dailyDate !== today) {
-      t.dailyDate = today;
-      t.dailyCount = 0;
-    }
-    if (dailyCap > 0 && (t.dailyCount || 0) >= dailyCap) {
-      const next = new Date();
-      next.setHours(8, 0, 0, 0);
-      if (next.getTime() <= Date.now()) next.setDate(next.getDate() + 1);
-      setStatus(p, 'WARN', `已达今日JD额度（${dailyCap} 条），明早8点后自动继续（可在弹窗"每日JD上限"调整，0=不限）`);
-      pushLog('WARN', `[${PLAT[p].name}] 今日JD额度已用完（${t.dailyCount}/${dailyCap}），休眠至次日08:00自动继续`);
-      await saveState();
-      scheduleNextTick(p, next.getTime() - Date.now() + 60000);
       return;
     }
     const now = Date.now();
@@ -721,28 +715,40 @@ async function enrichTick(p) {
           ? ` · ${d.diag.title || '无标题'}(${d.diag.n || '?'}字)${d.diag.text ? ' ' + String(d.diag.text).slice(0, 60) : ''}`
           : ' · 未取到JD，稍后重试';
     setStatus(p, 'ENRICH', `JD获取中：已完成 ${done}/${t.collected.length}（还剩 ${pendingCount(p)}）${tag}`);
-    pushLog(d.jd ? 'OK' : 'WARN', `[${PLAT[p].name}] JD ${t.collected.indexOf(j) + 1}/${t.collected.length} ${d.jd ? '✓' + (d.jdVia || '') : '✗未取到'} · ${(d.ms / 1000).toFixed(1)}s · ${j.name}${d.diag ? ' · ' + (d.diag.title || '') + `(${d.diag.n || '?'}字)` : ''}`);
+    pushLog(d.jd ? 'OK' : 'WARN', `[${PLAT[p].name}] JD ${t.collected.indexOf(j) + 1}/${t.collected.length} ${d.jd ? '✓' + (d.jdVia || '') : '✗未取到'} · ${(d.ms / 1000).toFixed(1)}s · ${j.name}${d.diag ? ' · ' + (d.diag.title || '') + `(${d.diag.n || '?'}字)` : ''}${d.diag && d.diag.text ? ' · ' + String(d.diag.text).slice(0, 80) : ''}`);
 
     // 计算下一步延迟（含风控应对与拟人节奏），以闹钟形式安排
     let delay = nextDelayMs(p);
     if (d.via === 'blocked') {
       r.blockedStreak++;
       r.slowFactor = Math.min(4, r.slowFactor * 1.5); // 被拦截立即整体减速
+      const isBanPage = d.diag && /封禁页/.test(String(d.diag.text || ''));
       if (r.blockedStreak === 1) {
         // 首次拦截就冷却：封禁期间继续请求只会延长封禁
         delay = 30000 + Math.random() * 30000;
         setStatus(p, 'WARN', '遇到风控拦截，冷却约1分钟后继续（已自动降低整体速度）…');
         pushLog('WARN', `[${PLAT[p].name}] 风控拦截：冷却${Math.round(delay / 1000)}s，整体减速×1.5=${r.slowFactor.toFixed(2)}`);
+      } else if (r.blockedStreak === 2) {
+        r.pausedUntil = Date.now() + 120000;
+        setStatus(p, 'WARN', '连续第2次被拦截，暂停2分钟后重试；若页面有滑块请手动完成');
+        pushLog('WARN', `[${PLAT[p].name}] 连续第2次拦截：熔断暂停2分钟`);
       }
       if (r.blockedStreak >= 3) {
-        r.pausedUntil = Date.now() + 90000;
-        setStatus(p, 'WARN', '连续遇到安全验证，暂停90秒后自动重试；若页面有滑块请手动完成');
-        pushLog('WARN', `[${PLAT[p].name}] 连续3次拦截/安检失败：熔断暂停90秒`);
+        // 实测教训（v2.0.1）：封禁期间 90s 循环重试会撞墙数小时且延长封禁 → 第3次直接停止
+        t.enrichScheduled = false;
+        await saveState();
+        if (isBanPage) {
+          setStatus(p, 'ERROR', 'IP/账号被风控限制（"访问受限"页），已自动停止。建议等待1小时以上或次日再点"补全JD"；已采数据可先导出CSV');
+          pushLog('ERROR', `[${PLAT[p].name}] 连续3次封禁页拦截：任务停止（继续重试只会延长封禁）`);
+        } else {
+          setStatus(p, 'ERROR', '连续3次安检未落位，已停止。请打开任务标签页手动完成安全验证（滑块/点选），再点"补全JD"继续');
+          pushLog('ERROR', `[${PLAT[p].name}] 连续3次安检未落位：任务停止，等待人工处理`);
+        }
+        return;
       }
     } else if (d.jd) {
       r.blockedStreak = 0;
       r.cleanJobs++;
-      t.dailyCount = (t.dailyCount || 0) + 1; // 每日额度计数
       if (r.cleanJobs % 15 === 0) r.slowFactor = Math.max(1, r.slowFactor * 0.9); // 顺利时缓慢恢复速度
       r.pausedUntil = 0;
     }
@@ -848,7 +854,7 @@ async function listTick(p) {
       pushLog('WARN', `[${PLAT[p].name}] 列表步进失败：${String(resp.error || '标签页无响应').slice(0, 100)}，尝试恢复标签页`);
       await recoverTab(p);
       notifyTab(t.activeTabId, 'START', 1200, 30);
-      scheduleNextListTick(p, 5000);
+      scheduleNextListTick(p, 8000); // 重载/导航需要时间
       return;
     }
     if (resp.exhausted) {

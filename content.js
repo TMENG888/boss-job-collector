@@ -618,8 +618,24 @@
   let jumpCheck = null; // { prevFirst } 跳页后首卡内容校验
 
   /* ================= 安全验证 / 卡片等待 ================= */
+  // 只认“可见”的验证组件：实习僧等站点页面里常驻隐藏的验证 SDK 占位
+  // 元素（iframe/class 命中但不可见），不做可见性检查会永久误判为“等待人工”
   function detectCaptcha() {
-    try { return !!document.querySelector(CAPTCHA_SEL); } catch (e) { return false; }
+    try {
+      const els = document.querySelectorAll(CAPTCHA_SEL);
+      for (const el of els) {
+        let visible = true;
+        try {
+          const r = el.getBoundingClientRect();
+          const cs = getComputedStyle(el);
+          visible = r.width > 30 && r.height > 30 && cs.display !== 'none' && cs.visibility !== 'hidden';
+        } catch (e) { /* 无法判定时保守视为可见 */ }
+        if (visible) return true;
+      }
+      return false;
+    } catch (e) {
+      return false;
+    }
   }
 
   async function waitCaptchaGone() {

@@ -147,8 +147,6 @@ function buildSxUrl(keyword, city) {
 $('startBtn').addEventListener('click', async () => {
   const target = Math.max(1, Math.min(1000, parseInt($('target').value, 10) || 100));
   const enrich = $('enrichCheck').checked;
-  const dailyCap = Math.max(0, parseInt($('dailyCap').value, 10) || 0);
-  await chrome.storage.local.set({ [SETTINGS_KEY]: Object.assign({}, (await chrome.storage.local.get(SETTINGS_KEY))[SETTINGS_KEY], { dailyCap }) });
   let urls;
   if ($('useCurrent').checked) {
     const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
@@ -189,7 +187,6 @@ $('logBtn').addEventListener('click', () => chrome.tabs.create({ url: chrome.run
 (async () => {
   const d = await chrome.storage.local.get(SETTINGS_KEY);
   const s = d[SETTINGS_KEY] || {};
-  $('dailyCap').value = s.dailyCap != null ? s.dailyCap : 300;
   applyPlatformUI();
   refresh();
   setInterval(refresh, 800);
