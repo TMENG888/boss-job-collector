@@ -870,8 +870,8 @@ async function listTick(p) {
       const adv = await sendToTabMsg(t.activeTabId, { type: 'LIST_ADVANCE' }, 8000);
       const action = adv && adv.action;
       if (action === 'jumped' || action === 'clicked' || !action) {
-        pushLog('ACTION', `[${PLAT[p].name}] 第 ${resp.page || '?'} 页采集完成，翻页加载下一页`);
-        scheduleNextListTick(p, 7000 + Math.random() * 5000); // 等新页加载 + 拟人翻页节奏
+        pushLog('ACTION', `[${PLAT[p].name}] 本页采集完成（列表 ${resp.cards || '?'} 条），点击下一页翻页`);
+        scheduleNextListTick(p, 7000 + Math.random() * 5000); // 等翻页渲染/加载 + 拟人翻页节奏
       } else {
         await handleExhausted(p);
       }

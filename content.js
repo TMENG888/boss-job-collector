@@ -695,27 +695,50 @@
     }
   }
 
-  // 实习僧翻页：URL 跳页为主（SSR MPA，与手点同效）；btn-next 置灰 = 最后一页
+  // 实习僧翻页：点击站点自己的"下一页"按钮（Element-UI 分页）。
+  // 【实测】URL 跳页 ?page=N 无效：Nuxt 站点分页不读该参数（快照全页无 page 参数，
+  // 路由就是 /interns），跳过去落地仍是第 1 页。点击站内按钮才是站点真实翻页路径；
+  // 先把分页控件滚动到可视区再点（用户实测按钮需可见后才点得动，组件可能懒激活）。
+  // 点击后两种形态都兼容：① SPA 原地重渲染（页面不卸载，等首卡/URL 变化）
+  // ② 整页导航（脚本随页面卸载，应答丢失，后台按"翻页已发起"+落地守卫处理）
   async function gotoNextPageSx() {
     const btn = qsOne(SEL_SX.pagerNext);
-    if (btn && btn.disabled) {
+    if (!btn) return false;
+    if (btn.disabled || isDisabled(btn)) {
       report('RUN', '已是最后一页，本搜索词采尽');
       return false;
     }
-    if (!btn && !qsOne(SEL_SX.pager)) {
-      // 页面无分页控件（异常/无结果页）：交由后台处理
-      return false;
-    }
     const before = firstCardKey();
-    const next = curPageNo() + 1;
+    const hrefBefore = location.href;
     try {
       sessionStorage.setItem('__boss_prev_first', before || '');
-      sessionStorage.setItem('__boss_next_page', String(next));
-      const u = new URL(location.href);
-      u.searchParams.set('page', String(next));
-      location.href = u.toString();
-      await sleep(3000); // 导航生效则页面卸载，走不到这里
+      sessionStorage.removeItem('__boss_next_page'); // 不再依赖 URL 页码
     } catch (e) { /* ignore */ }
+    const attempt = async (preWaitMs) => {
+      try { btn.scrollIntoView({ block: 'center' }); } catch (e) { try { btn.scrollIntoView(); } catch (e2) { /* ignore */ } }
+      await sleep(preWaitMs); // 等懒激活/水合
+      try { btn.click(); } catch (e) { return false; }
+      const t0 = Date.now();
+      while (Date.now() - t0 < 12000) {
+        await sleep(1000);
+        try {
+          if (location.href !== hrefBefore) return true; // 路由跳转成功
+          const now = firstCardKey();
+          if (now && now !== before) {
+            // 原地重渲染成功：清除首卡校验标志（SPA 下 ensureInit 不会再消费它）
+            try { sessionStorage.removeItem('__boss_prev_first'); } catch (e) { /* ignore */ }
+            return true;
+          }
+        } catch (e) {
+          return false; // 页面正在卸载（整页导航）→ 交给落地守卫
+        }
+      }
+      return false;
+    };
+    if (await attempt(1200)) return true;
+    // 一次重试：首次点击时组件可能尚未激活
+    if (await attempt(2500)) return true;
+    report('WARN', '点击"下一页"未生效（12s+12s 无任何变化），判定该搜索词已采尽');
     return false;
   }
 
@@ -1021,6 +1044,11 @@
       initDone = false;
       jumpCheck = null;
       resetSeenJobs();
+      // 清理上次会话遗留的跳页标志，避免 ensureInit 误判"跳页未生效→采尽"
+      try {
+        sessionStorage.removeItem('__boss_next_page');
+        sessionStorage.removeItem('__boss_prev_first');
+      } catch (e) { /* ignore */ }
     }
   }
 
