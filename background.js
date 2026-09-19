@@ -880,8 +880,8 @@ async function listTick(p) {
         pushLog('ERROR', `[${PLAT[p].name}] 列表阶段安全验证等待超时，任务停止`);
         return;
       }
-      setStatus(p, 'WAIT_CAPTCHA', '检测到安全验证，请在页面上手动完成（等待中，采到 ' + t.collected.length + ' 条）…');
-      pushLog('WARN', `[${PLAT[p].name}] 列表阶段安全验证：等待人工完成（第 ${r.listCaptRounds}/30 轮）`);
+      setStatus(p, 'WAIT_CAPTCHA', '检测到安全验证（' + String(resp.captcha).slice(0, 40) + '），请在页面上手动完成（等待中，采到 ' + t.collected.length + ' 条）…');
+      pushLog('WARN', `[${PLAT[p].name}] 列表阶段安全验证：${String(resp.captcha).slice(0, 60)}（第 ${r.listCaptRounds}/30 轮）`);
       scheduleNextListTick(p, 10000);
       return;
     }

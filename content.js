@@ -114,11 +114,6 @@
     companyBlock: ['.sider-company', '.company-info', '[class*="sider-company"]']
   };
 
-  const CAPTCHA_SEL =
-    '.nc-container,.nc_wrapper,#nc_1_wrapper,.geetest_panel,.geetest_window,' +
-    'iframe[src*="captcha"],iframe[src*="geetest"],iframe[src*="verify"],' +
-    '[class*="sec-code"],[class*="verify-wrap"],[class*="captcha"]';
-
   const SALARY_RE =
     /((?:\d+(?:\.\d+)?)\s*[-–~]\s*(?:\d+(?:\.\d+)?)\s*[Kk万W]?(?:\s*·\s*\d+薪)?|(?:\d+(?:\.\d+)?)\s*[Kk万](?:\s*·\s*\d+薪)?|\d+\s*元\s*\/\s*[天日月]|面议)/;
   const EXP_RE = /(应届生?|在校\/应届|在校生|实习|\d+\s*-\s*\d+年|\d+年以上|1年以内|经验不限|无需经验)/;
@@ -617,24 +612,25 @@
   let initDone = false;
   let jumpCheck = null; // { prevFirst } 跳页后首卡内容校验
 
-  /* ================= 安全验证 / 卡片等待 ================= */
-  // 只认“可见”的验证组件：实习僧等站点页面里常驻隐藏的验证 SDK 占位
-  // 元素（iframe/class 命中但不可见），不做可见性检查会永久误判为“等待人工”
+  /* ================= 安全验证判定 ================= */
+  // v2.0.2 起改为按 URL/页面特征判定，不再嗅探验证组件元素：
+  // 实测站点会预载隐藏的验证 SDK 面板（如极验 geetest 常驻 DOM，且可能以
+  // "移出视口"方式隐藏，宽高/可见性检查无法识别），元素嗅探必然误报。
+  // BOSS 的验证只以独立页面形式出现（滑块 /web/user/verify、被动安检
+  // /web/common/security-check），URL 判定零误报；其它站点用
+  // "极小页面 + 明确验证文案"兑底，正常列表/详情页永远不满足。
   function detectCaptcha() {
     try {
-      const els = document.querySelectorAll(CAPTCHA_SEL);
-      for (const el of els) {
-        let visible = true;
-        try {
-          const r = el.getBoundingClientRect();
-          const cs = getComputedStyle(el);
-          visible = r.width > 30 && r.height > 30 && cs.display !== 'none' && cs.visibility !== 'hidden';
-        } catch (e) { /* 无法判定时保守视为可见 */ }
-        if (visible) return true;
+      const url = location.href || '';
+      if (/zhipin\.com\/web\/user\/verify/i.test(url)) return 'BOSS滑块验证页';
+      if (/zhipin\.com\/web\/common\/security-check/i.test(url)) return 'BOSS安检页（通常数秒自动通过）';
+      const bt = String((document.body && document.body.innerText) || '').replace(/\s+/g, '');
+      if (bt && bt.length < 120 && /拖动滑块|滑块验证|安全验证|完成拼图|行为验证|验证码/.test(bt)) {
+        return '验证过渡页：' + bt.slice(0, 30);
       }
-      return false;
+      return '';
     } catch (e) {
-      return false;
+      return '';
     }
   }
 
@@ -650,7 +646,8 @@
   async function waitCards(timeout) {
     const t0 = Date.now();
     while (Date.now() - t0 < timeout) {
-      if (detectCaptcha()) return { ok: false, captcha: true };
+      const cap = detectCaptcha();
+      if (cap) return { ok: false, captcha: cap };
       if (findCards().length) return { ok: true };
       await sleep(800);
     }
@@ -740,8 +737,9 @@
       const t0 = Date.now();
       while (Date.now() - t0 < CONFIG.pageChangeTimeout) {
         await sleep(700);
-        if (detectCaptcha()) {
-          report('WAIT_CAPTCHA', '检测到安全验证，请在页面上手动完成…');
+        const cap = detectCaptcha();
+        if (cap) {
+          report('WAIT_CAPTCHA', '检测到安全验证（' + cap + '），请在页面上手动完成…');
           await waitCaptchaGone();
         }
         const now = firstCardKey();
@@ -1064,7 +1062,8 @@
     if (stepBusy) return { busy: true };
     stepBusy = true;
     try {
-      if (detectCaptcha()) return { captcha: true, cards: 0, atBottom: false };
+      const cap = detectCaptcha();
+      if (cap) return { captcha: cap, cards: 0, atBottom: false };
       const guard = await ensureInit();
       if (guard === 'exhausted') return { exhausted: true };
       if (!findCards().length) {
