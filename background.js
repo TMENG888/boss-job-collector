@@ -563,15 +563,22 @@ async function warmTabDetail(link, p) {
       } catch (e) { /* 注入也失败，走"未注入"诊断分支 */ }
     }
     let resp = null;
+    const errs = [];
     if (injected) {
-      // 页面内脚本等水合（最多8s）后提取；未取到则重试下发
-      for (let i = 0; i < 4; i++) {
-        // sendToTabMsg 自带 25s 超时：内容脚本若收到消息但永不应答（历史 bug：异步提取无 .catch），
-        // 裸 sendMessage 会永久挂起 → tickBusy 卡死 → 心跳也不救 → 整条补全链卡死
+      // 页面内脚本等水合后提取；未取到则重试下发。
+      // gone ≠ 放弃：双平台并行时详情页可能在 PING 与 EXTRACT 之间二次跳转/重渲染杀掉脚本上下文，
+      // 实测同一岗位稍后重试必成功 → 重新 PING 确认后继续重试（不再一轮 gone 就放弃）
+      for (let i = 0; i < 6; i++) {
         const r2 = await sendToTabMsg(tabId, { type: 'EXTRACT_DETAIL' }, 25000);
-        if (r2 && r2.gone) break; // 页面已跳转/上下文失效，重试无意义
+        if (r2 && r2.gone) {
+          errs.push(String(r2.error || 'gone').slice(0, 60));
+          await sleep(1200);
+          if (await pingTab(tabId, 1500)) continue; // 上下文已重注入：继续提取
+          break; // 上下文真死了（等待外层下次重试）
+        }
         resp = r2 && r2.timeout ? null : r2;
         if (resp && resp.detail && resp.detail.jd) break;
+        if (r2 && r2.timeout) errs.push('超时25s');
         await sleep(1500);
       }
     }
@@ -579,7 +586,9 @@ async function warmTabDetail(link, p) {
       jd: '', via: 'tab',
       diag: {
         src: 'tab', title: injected ? '内容脚本已响应但无结果' : '内容脚本未注入/未响应',
-        url: link, n: 0, text: injected ? '多次提取均未返回JD' : '详情页已加载但消息未送达（检查扩展是否刚重载过，请刷新页面后重试）'
+        url: link, n: 0,
+        text: (injected ? '多次提取均未返回JD' : '详情页已加载但消息未送达（检查扩展是否刚重载过，请刷新页面后重试）')
+          + (errs.length ? '（通道错误：' + errs.join(';') + '）' : '')
       }
     };
     d.ms = Date.now() - t0;
@@ -704,7 +713,13 @@ async function enrichTick(p) {
     j.fetchStartedAt = Date.now();
     await saveState();
     setStatus(p, 'ENRICH', `JD详情 ${t.collected.indexOf(j) + 1}/${t.collected.length}：${j.name}`);
-    const d = await warmTabDetail(j.link, p);
+    // 首次尝试
+    let d = await warmTabDetail(j.link, p);
+    // 立即重试：双平台并行时详情页可能在消息边界二次跳转/重渲染杀掉脚本上下文，
+    // 实测同一岗位稍后重试大多必成功 → 不等整轮跑完，就地重新导航再试一次（风控拦截除外）
+    if (!d.jd && d.via !== 'blocked') {
+      d = await warmTabDetail(j.link, p);
+    }
     applyDetail(p, key, d);
     await saveState(); // 立即持久化：SW 在步间休眠也不丢结果（此前丢失导致同一岗位反复重抓）
     // 连续基础设施故障熔断：重建标签页 + 暂停1分钟，避免 8s 间隔级联烧穿队列
