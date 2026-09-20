@@ -354,7 +354,9 @@ function scheduleEnrich(p) {
   r.enrichStop = false;
   saveState();
   setStatus(p, 'ENRICH', '开始补全JD详情（模拟真人点击进出详情页，可后台运行）…');
-  pushLog('ACTION', `[${PLAT[p].name}] 调度JD补全（闹钟驱动，可后台）`);
+  // 预期管理：每条均摊约 12~20s（详情页停留+条间间隔+每5~9条长休），提前告知避免误判卡死
+  const pend = pendingCount(p);
+  pushLog('ACTION', `[${PLAT[p].name}] 调度JD补全（闹钟驱动，可后台）· 待补 ${pend} 条 · 预计约 ${(pend * 15 / 3600).toFixed(1)} 小时（拟人节奏防风控，期间可最小化浏览器/切走）`);
   scheduleNextTick(p, 3000);
 }
 
@@ -727,10 +729,14 @@ async function enrichTick(p) {
           ? ` · ${d.diag.title || '无标题'}(${d.diag.n || '?'}字)${d.diag.text ? ' ' + String(d.diag.text).slice(0, 60) : ''}`
           : ' · 未取到JD，稍后重试';
     setStatus(p, 'ENRICH', `JD获取中：已完成 ${done}/${t.collected.length}（还剩 ${pendingCount(p)}）${tag}`);
-    pushLog(d.jd ? 'OK' : 'WARN', `[${PLAT[p].name}] JD ${t.collected.indexOf(j) + 1}/${t.collected.length} ${d.jd ? '✓' + (d.jdVia || '') : '✗未取到'} · ${(d.ms / 1000).toFixed(1)}s · ${j.name}${d.diag ? ' · ' + (d.diag.title || '') + `(${d.diag.n || '?'}字)` : ''}${d.diag && d.diag.text ? ' · ' + String(d.diag.text).slice(0, 80) : ''}`);
+    pushLog(d.jd ? 'OK' : 'WARN', `[${PLAT[p].name}] JD ${t.collected.indexOf(j) + 1}/${t.collected.length} ${d.jd ? '✓' + (d.jdVia || '') : '✗未取到'} · ${(d.ms / 1000).toFixed(1)}s · ${j.name} · #${String(jobKey(j)).slice(0, 14)}${d.diag ? ' · ' + (d.diag.title || '') + `(${d.diag.n || '?'}字)` : ''}${d.diag && d.diag.text ? ' · ' + String(d.diag.text).slice(0, 80) : ''}`);
 
     // 计算下一步延迟（含风控应对与拟人节奏），以闹钟形式安排
     let delay = nextDelayMs(p);
+    // 拟人长休可视化：每5~9条随机休30~90s（防风控设计行为），此前完全静默，用户会误判为卡死
+    if (delay > 25000) {
+      pushLog('SYS', `[${PLAT[p].name}] 拟人长休 ${Math.round(delay / 1000)}s 后自动继续（每5~9条随机休息的防风控节奏，非卡死）`);
+    }
     if (d.via === 'blocked') {
       r.blockedStreak++;
       r.slowFactor = Math.min(4, r.slowFactor * 1.5); // 被拦截立即整体减速
