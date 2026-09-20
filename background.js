@@ -69,6 +69,7 @@ function rt(p) {
     RT[p] = {
       enrichStop: false,
       tickBusy: false,
+      tickStartedAt: 0,        // 当前补全单步开始时间（看门狗：超过阈值强制重置，防 tickBusy 卡死）
       blockedStreak: 0,
       pausedUntil: 0,          // 熔断：连续被风控拦截时暂停到该时间点
       slowFactor: 1,           // 风控自适应减速：每次被拦截×1.5（上限4），每15条顺利×0.9（下限1）
@@ -77,6 +78,7 @@ function rt(p) {
       cleanJobs: 0,
       infraFailStreak: 0,
       listBusy: false,
+      listStartedAt: 0,      // 当前列表单步开始时间（同上）
       lastListCards: 0,
       listNoGrowth: 0,
       listCaptRounds: 0,
@@ -546,29 +548,28 @@ async function warmTabDetail(link, p) {
     // 先探测内容脚本已注入（最多6×1s），再提取；避免把"未注入"误判成"提取为空"
     let injected = false;
     for (let i = 0; i < 6; i++) {
-      try {
-        await chrome.tabs.sendMessage(tabId, { type: 'PING' });
-        injected = true;
-        break;
-      } catch (e) { await sleep(1000); }
+      // pingTab 自带超时：无超时的 sendMessage 若对端永不应答会永久挂起（单步卡死根因之一）
+      if (await pingTab(tabId, 1500)) { injected = true; break; }
+      await sleep(800);
     }
     if (!injected) {
       // 自动注入失败（扩展重载后的孤儿页/注入时序问题）：用 scripting API 手动注入再试
       try {
         await chrome.scripting.executeScript({ target: { tabId }, files: ['content.js'] });
         await sleep(800);
-        await chrome.tabs.sendMessage(tabId, { type: 'PING' });
-        injected = true;
+        if (await pingTab(tabId, 1500)) injected = true;
       } catch (e) { /* 注入也失败，走"未注入"诊断分支 */ }
     }
     let resp = null;
     if (injected) {
       // 页面内脚本等水合（最多8s）后提取；未取到则重试下发
       for (let i = 0; i < 4; i++) {
-        try {
-          resp = await chrome.tabs.sendMessage(tabId, { type: 'EXTRACT_DETAIL' });
-          if (resp && resp.detail && resp.detail.jd) break;
-        } catch (e) { /* 消息失败，稍后重试 */ }
+        // sendToTabMsg 自带 25s 超时：内容脚本若收到消息但永不应答（历史 bug：异步提取无 .catch），
+        // 裸 sendMessage 会永久挂起 → tickBusy 卡死 → 心跳也不救 → 整条补全链卡死
+        const r2 = await sendToTabMsg(tabId, { type: 'EXTRACT_DETAIL' }, 25000);
+        if (r2 && r2.gone) break; // 页面已跳转/上下文失效，重试无意义
+        resp = r2 && r2.timeout ? null : r2;
+        if (resp && resp.detail && resp.detail.jd) break;
         await sleep(1500);
       }
     }
@@ -665,6 +666,7 @@ async function enrichTick(p) {
   const r = rt(p);
   if (r.tickBusy || r.enrichStop || !t.enrichScheduled) return;
   r.tickBusy = true;
+  r.tickStartedAt = Date.now();
   try {
     if (Date.now() < r.pausedUntil) {
       scheduleNextTick(p, r.pausedUntil - Date.now() + 1000); // 熔断冷却中，等解除
@@ -771,6 +773,7 @@ async function enrichTick(p) {
     if (t.enrichScheduled && !r.enrichStop) scheduleNextTick(p, 15000);
   } finally {
     r.tickBusy = false;
+    r.tickStartedAt = 0;
   }
 }
 
@@ -844,6 +847,7 @@ async function listTick(p) {
   const r = rt(p);
   if (r.listBusy || r.enrichStop || !t.running || t.enrichScheduled) return;
   r.listBusy = true;
+  r.listStartedAt = Date.now();
   try {
     if (Date.now() < r.pausedUntil) {
       scheduleNextListTick(p, r.pausedUntil - Date.now() + 1000);
@@ -956,6 +960,7 @@ async function listTick(p) {
     if (t.running && !r.enrichStop) scheduleNextListTick(p, 4000); // 链路自愈
   } finally {
     r.listBusy = false;
+    r.listStartedAt = 0;
   }
 }
 
@@ -971,6 +976,19 @@ chrome.alarms.onAlarm.addListener((alarm) => {
       for (const p of PLATFORMS) {
         const t = T(p);
         const r = rt(p);
+        // 看门狗：单步超过 6 分钟视为卡死（历史上 tickBusy 卡死后心跳会永远跳过救援）
+        if (r.tickBusy && r.tickStartedAt && Date.now() - r.tickStartedAt > 360000) {
+          pushLog('WARN', `[${PLAT[p].name}] 看门狗：补全单步停滞超过 6 分钟，强制重置链路继续`);
+          r.tickBusy = false; r.tickStartedAt = 0;
+          if (t.enrichScheduled && !r.enrichStop) scheduleNextTick(p, 3000);
+          continue;
+        }
+        if (r.listBusy && r.listStartedAt && Date.now() - r.listStartedAt > 360000) {
+          pushLog('WARN', `[${PLAT[p].name}] 看门狗：列表单步停滞超过 6 分钟，强制重置链路继续`);
+          r.listBusy = false; r.listStartedAt = 0;
+          if (t.running && !t.enrichScheduled && !r.enrichStop) scheduleNextListTick(p, 3000);
+          continue;
+        }
         if (r.tickBusy || r.listBusy || r.enrichStop) continue;
         if (t.enrichScheduled && !has(PLAT[p].alarmEnrich)) {
           pushLog('SYS', `[${PLAT[p].name}] 心跳检测到JD补全闹钟链断裂，已重新拉起`);
@@ -1153,6 +1171,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         }
         t.enrich = true;
         t.enrichScheduled = false; // 手动触发前重置，保证后续自动调度可用
+        // 用户手动指令 = 强制接管：若上次单步已停滞超 3 分钟，重置锁后再拉起
+        if (r.tickBusy && r.tickStartedAt && Date.now() - r.tickStartedAt > 180000) {
+          pushLog('WARN', `[${PLAT[p].name}] 检测到上次补全单步停滞超过 3 分钟，已强制重置链路`);
+          r.tickBusy = false; r.tickStartedAt = 0;
+        }
         let tabId = t.activeTabId;
         if (!(await tabExists(tabId))) {
           const tab = await openSearchPage(t.searchUrl || PLAT[p].homeUrl, p);

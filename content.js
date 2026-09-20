@@ -1223,7 +1223,12 @@
     } else if (msg.type === 'EXTRACT_DETAIL') {
       // 详情页内的提取请求（后台热标签页通道）
       try {
-        extractDetailTab().then((detail) => sendResponse({ detail }));
+        // 必须捕荻异步 rejection：否则 sendResponse 永不执行，后台无超时等待会永久挂起（补全链卡死的根因之一）
+        extractDetailTab()
+          .then((detail) => sendResponse({ detail }))
+          .catch((e) => sendResponse({
+            detail: { jd: '', via: 'error', diag: { src: 'tab', title: '提取异常', url: location.href, n: 0, text: String((e && e.message) || e).slice(0, 120) } }
+          }));
       } catch (e) {
         sendResponse({
           detail: { jd: '', via: 'error', diag: { src: 'tab', title: '提取异常', url: location.href, n: 0, text: String((e && e.message) || e).slice(0, 120) } }

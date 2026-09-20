@@ -1,5 +1,19 @@
 # 更新日志
 
+## 2.0.6
+
+- **修复：点击“补全JD”后卡死停滞**（三层叠加缺陷，实测定位）：
+  1. `warmTabDetail` 里 `EXTRACT_DETAIL` 用无超时 `sendMessage`：内容脚本收到消息但永不应答时
+     await 永久挂起 → 改用自带 25s 超时的 `sendToTabMsg`；PING 探测统一改 `pingTab`（带超时）
+  2. 内容脚本 `extractDetailTab().then(...)` 无 `.catch`：异步提取一旦 reject，`sendResponse` 永不执行
+     （正好触发上一条）→ 补上 `.catch`，异常也会应答错误详情
+  3. `tickBusy` 卡死后心跳永远跳过救援、手动“补全JD”也被 `if (tickBusy) return` 静默吞掉
+     → 心跳新增看门狗（单步超 6 分钟强制重置链路并重新拉起）；手动补全指令若检测到停滞超 3
+     分钟自动强制重置；列表链路同步加固
+- 全链路不再存在无超时的 `await sendMessage`；即便未来出现新的挂起点，看门狗也能在
+  约 7 分钟内自愈，不再需要手动重载扩展
+- jsdom 回归：NUXT 结构化提取 8/8 断言通过
+
 ## 2.0.5
 
 - **实习僧详情字段对齐 BOSS 数据粒度**（用户提供详情页快照实证）：
