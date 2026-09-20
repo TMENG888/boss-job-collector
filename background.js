@@ -828,8 +828,8 @@ async function handleExhausted(p) {
   if (t.running && t.queueIndex + 1 < (t.queue || []).length) {
     t.queueIndex++;
     t.searchUrl = t.queue[t.queueIndex];
-    setStatus(p, 'SWITCH', `当前搜索词已采尽，自动切换下一搜索词（${t.queueIndex + 1}/${t.queue.length}）…`);
-    pushLog('ACTION', `[${PLAT[p].name}] 搜索词采尽，接力切换 ${t.queueIndex + 1}/${t.queue.length}：${t.searchUrl}`);
+    setStatus(p, 'SWITCH', `当前搜索会话已采尽，自动接力下一个（${t.queueIndex + 1}/${t.queue.length}）…`);
+    pushLog('ACTION', `[${PLAT[p].name}] 搜索会话采尽（城市/关键词），接力切换 ${t.queueIndex + 1}/${t.queue.length}`);
     await saveState();
     try {
       await chrome.tabs.update(t.activeTabId, { url: t.searchUrl });
@@ -1076,7 +1076,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         t.enrichScheduled = false;
         t.concurrency = 1;
         setStatus(p, 'RUN', '正在打开/定位搜索页面…');
-        pushLog('ACTION', `[${PLAT[p].name}] 开始采集：${(msg.urls && msg.urls.length) || 1} 个搜索词 · 目标 ${t.target} · 自动JD=${t.enrich}`);
+        pushLog('ACTION', `[${PLAT[p].name}] 开始采集：${(msg.urls && msg.urls.length) || 1} 组搜索会话（城市×关键词） · 目标 ${t.target} · 自动JD=${t.enrich}`);
         await saveState();
         try {
           const tab = await openSearchPage(t.searchUrl, p);

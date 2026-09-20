@@ -76,13 +76,13 @@ function applyPlatformUI() {
   $('tabSx').classList.toggle('active', curPlatform === 'sx');
   if (curPlatform === 'boss') {
     $('kwLabel').textContent = '岗位关键词（多个用逗号分隔，采完一个自动接力下一个）';
-    $('cityLabel').textContent = '城市（留空=全国）';
-    $('city').placeholder = '如：广州';
+    $('cityLabel').textContent = '城市（多个用逗号分隔接力；留空=全国）';
+    $('city').placeholder = '如：广州,杭州（BOSS仅支持内置城市，未识别按全国）';
     $('useCurrentLabel').textContent = '采集当前已打开的搜索页（忽略上方设置）';
   } else {
     $('kwLabel').textContent = '岗位关键词（多个用逗号分隔，采完一个自动接力下一个）';
-    $('cityLabel').textContent = '城市（填城市名，留空=全国）';
-    $('city').placeholder = '如：武汉 / 全国';
+    $('cityLabel').textContent = '城市（多个用逗号分隔接力；留空=全国）';
+    $('city').placeholder = '如：武汉,长沙 / 全国';
     $('useCurrentLabel').textContent = '采集当前已打开的实习僧搜索页（忽略上方设置）';
   }
   loadPlatformSettings();
@@ -145,7 +145,7 @@ function buildSxUrl(keyword, city) {
 }
 
 $('startBtn').addEventListener('click', async () => {
-  const target = Math.max(1, Math.min(1000, parseInt($('target').value, 10) || 100));
+  const target = Math.max(1, Math.min(5000, parseInt($('target').value, 10) || 100));
   const enrich = $('enrichCheck').checked;
   let urls;
   if ($('useCurrent').checked) {
@@ -165,15 +165,24 @@ $('startBtn').addEventListener('click', async () => {
     // 每个关键词严格忠于自身检索结果，不做变体扩展
     const keywords = raw.split(/[,，、]+/).map((x) => x.trim()).filter(Boolean);
     if (!keywords.length) keywords.push(curPlatform === 'boss' ? 'RPA' : '智能体开发');
-    await savePlatformSettings({ keyword: raw, cityName: cityInput, city: curPlatform === 'boss' ? resolveCity(cityInput) : cityInput, target });
+    // 多城市：逗号分隔，按“先采完一个城市的全部关键词，再下一城”接力（城市×关键词 = 搜索会话队列）
+    const cities = cityInput ? cityInput.split(/[,，、]+/).map((x) => x.trim()).filter(Boolean) : [''];
+    if (!cities.length) cities.push('');
+    await savePlatformSettings({
+      keyword: raw, cityName: cityInput,
+      city: curPlatform === 'boss' ? cities.map(resolveCity).join(',') : cityInput,
+      target
+    });
     const seen = new Set();
     urls = [];
-    for (const kw of keywords) {
-      const u = curPlatform === 'boss' ? buildBossUrl(kw, resolveCity(cityInput)) : buildSxUrl(kw, cityInput || '全国');
-      if (!seen.has(u)) { seen.add(u); urls.push(u); }
+    for (const c of cities) {
+      for (const kw of keywords) {
+        const u = curPlatform === 'boss' ? buildBossUrl(kw, resolveCity(c)) : buildSxUrl(kw, c || '全国');
+        if (!seen.has(u)) { seen.add(u); urls.push(u); }
+      }
     }
   }
-  setStatus('RUN', `正在启动（共 ${urls.length} 个搜索词）…`);
+  setStatus('RUN', `正在启动（共 ${urls.length} 组搜索会话：城市×关键词）…`);
   chrome.runtime.sendMessage({ type: 'START', platform: curPlatform, urls, url: urls[0], target, enrich });
 });
 
