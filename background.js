@@ -1077,6 +1077,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         t.concurrency = 1;
         setStatus(p, 'RUN', '正在打开/定位搜索页面…');
         pushLog('ACTION', `[${PLAT[p].name}] 开始采集：${(msg.urls && msg.urls.length) || 1} 组搜索会话（城市×关键词） · 目标 ${t.target} · 自动JD=${t.enrich}`);
+        if (msg.note) pushLog('WARN', `[${PLAT[p].name}] ${msg.note}`);
         await saveState();
         try {
           const tab = await openSearchPage(t.searchUrl, p);
